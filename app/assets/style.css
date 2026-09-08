@@ -300,6 +300,7 @@ a.btn-outline:hover {
   position: absolute;
   top: 8px;
   right: 8px;
+  z-index: 5;
   display: flex;
   gap: 4px;
   opacity: 0;
@@ -331,6 +332,27 @@ a.btn-outline:hover {
   background: #fff;
   border-color: var(--color-primary);
   color: var(--color-primary);
+}
+
+/* Main viewer image next to its per-channel colorbars */
+.viewer-image-row {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.viewer-image-row > .plot-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.viewer-colorbars-img {
+  flex: 0 0 auto;
+  max-width: 130px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: #fff;
+  display: block;
 }
 
 /* Click-to-zoom image viewer */

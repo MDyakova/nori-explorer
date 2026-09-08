@@ -163,6 +163,24 @@ function noriCurrentZoom(img) {
   return parseFloat(img.dataset.zoomPct || '100') || 100;
 }
 
+// Zoom percentage that fits the whole (natural-size) image inside its .zoom-scroll
+// viewport — scales down for images bigger than the visible area, but never scales up
+// past 100% (native resolution) for images that are already smaller than it.
+function noriFitZoomPct(img) {
+  var scroller = img.closest('.zoom-scroll');
+  var naturalWidth = img.naturalWidth;
+  var naturalHeight = img.naturalHeight;
+  if (!scroller || !naturalWidth || !naturalHeight) {
+    return 100;
+  }
+  var fitScale = Math.min(
+    scroller.clientWidth / naturalWidth,
+    scroller.clientHeight / naturalHeight,
+  );
+  var pct = Math.round(Math.min(fitScale * 100, 100));
+  return Math.min(Math.max(pct, NORI_ZOOM_MIN), NORI_ZOOM_MAX);
+}
+
 document.addEventListener('click', function (event) {
   var img = event.target.closest('.zoom-image');
   if (!img || noriRegionState.active) {
@@ -185,29 +203,30 @@ document.addEventListener('contextmenu', function (event) {
   noriApplyZoom(img, pct, event.clientX, event.clientY);
 });
 
-// Reset zoom to 100% and clear any selected regions whenever a new image is
-// loaded into a .zoom-image element.
+// Fit the image to its .zoom-scroll viewport whenever a new image is loaded into a
+// .zoom-image element. Selected regions are NOT cleared here — they're kept across
+// image switches (so you can pick regions from several images and compare them
+// together) — only the visual boxes for the now-hidden image are removed; boxes for
+// the newly-shown image (if any were drawn on it before) are redrawn from the still-
+// held region data.
 document.addEventListener('load', function (event) {
   var img = event.target;
   if (!img.classList || !img.classList.contains('zoom-image')) {
     return;
   }
+  // Clear any leftover width from a previously displayed image first, so the fit
+  // calculation below measures this image's own natural aspect ratio.
   img.style.width = '';
-  img.dataset.zoomPct = '100';
-  var readout = noriZoomReadout(img);
-  if (readout) {
-    readout.textContent = 'Zoom: 100%';
-  }
+  noriApplyZoom(img, noriFitZoomPct(img), null, null);
 
   var wrap = img.closest('.zoom-image-wrap');
   if (wrap) {
-    noriClearRegions(wrap);
-    noriPublishRegions();
+    noriRedrawRegionBoxes(wrap, img.dataset.imagePath || '');
   }
 }, true);
 
 // --- region selection (drag one or more rectangles to plot each one's protein/lipid
-// distribution; regions persist on the image until "Clear" or a new image is loaded) ---
+// distribution; regions persist across image switches until "Clear" is clicked) ---
 
 var NORI_REGION_COLORS = ['#0f766e', '#b45309', '#7c3aed', '#be123c', '#0369a1', '#15803d'];
 
@@ -227,8 +246,10 @@ function noriSetReactInputValue(id, value) {
 }
 
 function noriPublishRegions() {
-  var bboxes = noriRegionState.regions.map(function (r) { return r.bbox; });
-  noriSetReactInputValue('viewer-region-input', JSON.stringify(bboxes));
+  var entries = noriRegionState.regions.map(function (r) {
+    return { bbox: r.bbox, image: r.imagePath };
+  });
+  noriSetReactInputValue('viewer-region-input', JSON.stringify(entries));
 }
 
 // The dashed box that tracks the mouse while dragging out a new selection.
@@ -240,6 +261,42 @@ function noriDraftBoxFor(wrap) {
     wrap.appendChild(box);
   }
   return box;
+}
+
+// Creates (or recreates, e.g. when switching back to an image with existing regions)
+// the finalized, numbered, percentage-positioned box for one region.
+function noriCreateRegionBox(wrap, id, bbox) {
+  var color = NORI_REGION_COLORS[(id - 1) % NORI_REGION_COLORS.length];
+
+  var box = document.createElement('div');
+  box.className = 'region-box region-final-box';
+  box.dataset.regionId = String(id);
+  box.style.left = (bbox.x0 * 100) + '%';
+  box.style.top = (bbox.y0 * 100) + '%';
+  box.style.width = ((bbox.x1 - bbox.x0) * 100) + '%';
+  box.style.height = ((bbox.y1 - bbox.y0) * 100) + '%';
+  box.style.borderColor = color;
+  box.style.background = 'transparent';
+
+  var badge = document.createElement('span');
+  badge.className = 'region-box-badge';
+  badge.style.background = color;
+  badge.textContent = String(id);
+  box.appendChild(badge);
+
+  wrap.appendChild(box);
+  return box;
+}
+
+// Removes all drawn boxes from `wrap` and redraws only the ones belonging to
+// `imagePath` (the image currently shown in it) from the held region data.
+function noriRedrawRegionBoxes(wrap, imagePath) {
+  wrap.querySelectorAll('.region-box').forEach(function (box) { box.remove(); });
+  noriRegionState.regions.forEach(function (r) {
+    if (r.imagePath === imagePath) {
+      noriCreateRegionBox(wrap, r.id, r.bbox);
+    }
+  });
 }
 
 function noriClearRegions(wrap) {
@@ -345,32 +402,16 @@ document.addEventListener('mouseup', function (event) {
   // Store position/size as percentages of the wrap so the box stays aligned
   // with the image at any zoom level without needing to be recomputed.
   var id = noriRegionState.nextId++;
-  var color = NORI_REGION_COLORS[(id - 1) % NORI_REGION_COLORS.length];
-
-  var box = document.createElement('div');
-  box.className = 'region-box region-final-box';
-  box.dataset.regionId = String(id);
-  box.style.left = (left / wrapWidth * 100) + '%';
-  box.style.top = (top / wrapHeight * 100) + '%';
-  box.style.width = (width / wrapWidth * 100) + '%';
-  box.style.height = (height / wrapHeight * 100) + '%';
-  box.style.borderColor = color;
-  box.style.background = 'transparent';
-
-  var badge = document.createElement('span');
-  badge.className = 'region-box-badge';
-  badge.style.background = color;
-  badge.textContent = String(id);
-  box.appendChild(badge);
-
-  wrap.appendChild(box);
-
   var bbox = {
     x0: left / wrapWidth,
     y0: top / wrapHeight,
     x1: (left + width) / wrapWidth,
     y1: (top + height) / wrapHeight,
   };
-  noriRegionState.regions.push({ id: id, bbox: bbox });
+  noriCreateRegionBox(wrap, id, bbox);
+
+  var imgEl = wrap.querySelector('.zoom-image');
+  var imagePath = (imgEl && imgEl.dataset.imagePath) || '';
+  noriRegionState.regions.push({ id: id, bbox: bbox, imagePath: imagePath });
   noriPublishRegions();
 });
