@@ -11,6 +11,7 @@ Run with:
 import argparse
 import base64
 import io
+import json
 import os
 import threading
 import traceback
@@ -31,6 +32,16 @@ from dash import Input, Output, State, dcc, html
 from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix, mean_absolute_error, r2_score
 from tifffile import TiffFile
+
+
+# Mirrors NORI_REGION_COLORS in assets/plot_toolbar.js so a region's badge color here
+# matches the outline drawn on the image for it.
+REGION_COLORS = ['#0f766e', '#b45309', '#7c3aed', '#be123c', '#0369a1', '#15803d']
+
+# Calibration coefficients converting raw protein/lipid pixel intensities to
+# quantitative units for region distribution/mean analysis.
+PROTEIN_CALIBRATION_K = 1.3643 * 1000 / 8192
+LIPID_CALIBRATION_K = 1.0101 * 1000 / 8192
 
 
 def is_valid_base_dir(base_dir):
@@ -280,6 +291,23 @@ def list_whole_images(base_dir, group, task, model_name):
     return sorted(whole_image_name.unique())
 
 
+def list_data_tif_images(base_dir, group):
+    """List every .tif/.tiff under base_dir/data/<group>/<class>/, as paths relative to that folder."""
+    data_group_dir = os.path.join(base_dir, 'data', group)
+    if not os.path.isdir(data_group_dir):
+        return []
+
+    images = []
+    for class_name in sorted(os.listdir(data_group_dir)):
+        class_dir = os.path.join(data_group_dir, class_name)
+        if not os.path.isdir(class_dir):
+            continue
+        for fname in sorted(os.listdir(class_dir)):
+            if fname.lower().endswith(('.tif', '.tiff')):
+                images.append(os.path.join(class_name, fname))
+    return images
+
+
 def add_tile_xy(umap_df_im):
     umap_df_im = umap_df_im.copy()
     umap_df_im['y'] = umap_df_im['filename'].apply(lambda p: int(p.split('.jpg')[0].split('_')[-2]))
@@ -386,6 +414,142 @@ def build_whole_image_overlay(
     return f'data:image/png;base64,{encoded}', tif_path, tile_size
 
 
+def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0):
+    """Render the protein/lipid NoRI composite for one whole-slide .tif, resized to `scale` of its original size."""
+    tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
+    max_p, max_l = load_max_values(base_dir, group, task)
+
+    with TiffFile(tif_path) as tif:
+        image = tif.asarray()
+
+    image_nori = np.stack([image[0], image[1], image[0] * 0], axis=0).astype(float)
+    filtered_image = image_filter(image_nori)
+    filtered_image[0] = filtered_image[0] / max_p
+    filtered_image[1] = filtered_image[1] / max_l
+    filtered_image = np.clip(filtered_image, 0, 1)
+
+    transformed_image = (filtered_image * 255).transpose((1, 2, 0)).astype(np.uint8)
+    pil_img = Image.fromarray(transformed_image)
+
+    width = max(1, round(pil_img.width * scale))
+    height = max(1, round(pil_img.height * scale))
+    if (width, height) != pil_img.size:
+        pil_img = pil_img.resize((width, height), resample=Image.LANCZOS)
+
+    return pil_img, tif_path
+
+
+def _iqr_bounds(values, k=1.5):
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = q3 - q1
+    if iqr <= 0:
+        return -np.inf, np.inf
+    return q1 - k * iqr, q3 + k * iqr
+
+
+def remove_outliers(protein, lipid, k=1.5):
+    """Drop pixels whose protein or lipid value is an outlier (outside
+    Q1 - k*IQR, Q3 + k*IQR) for its own channel."""
+    p_lo, p_hi = _iqr_bounds(protein, k)
+    l_lo, l_hi = _iqr_bounds(lipid, k)
+    mask = (protein >= p_lo) & (protein <= p_hi) & (lipid >= l_lo) & (lipid <= l_hi)
+    if mask.sum() < 2:
+        return protein, lipid
+    return protein[mask], lipid[mask]
+
+
+def build_region_analysis(base_dir, group, task, rel_image_path, bbox, max_thumb_px=220):
+    """For a fractional bbox (values in [0, 1], relative to the image's own width/height),
+    return a small protein/lipid composite thumbnail of the cropped region plus its
+    (outlier-removed, calibrated) protein/lipid pixel values and their means."""
+    tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
+    max_p, max_l = load_max_values(base_dir, group, task)
+
+    with TiffFile(tif_path) as tif:
+        image = tif.asarray()
+
+    h, w = image[0].shape
+    x0 = int(np.clip(round(bbox['x0'] * w), 0, w))
+    x1 = int(np.clip(round(bbox['x1'] * w), 0, w))
+    y0 = int(np.clip(round(bbox['y0'] * h), 0, h))
+    y1 = int(np.clip(round(bbox['y1'] * h), 0, h))
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        raise ValueError('Selected region is too small to analyze.')
+
+    protein_crop = image[0][y0:y1, x0:x1].astype(float)
+    lipid_crop = image[1][y0:y1, x0:x1].astype(float)
+
+    composite = np.stack([protein_crop, lipid_crop, protein_crop * 0], axis=0)
+    composite = image_filter(composite)
+    composite[0] = composite[0] / max_p
+    composite[1] = composite[1] / max_l
+    composite = np.clip(composite, 0, 1)
+    composite = (composite * 255).transpose((1, 2, 0)).astype(np.uint8)
+    thumb = Image.fromarray(composite)
+    thumb_scale = min(1.0, max_thumb_px / max(thumb.width, thumb.height))
+    if thumb_scale < 1.0:
+        thumb = thumb.resize(
+            (max(1, round(thumb.width * thumb_scale)), max(1, round(thumb.height * thumb_scale))),
+            resample=Image.LANCZOS,
+        )
+
+    protein_raw = protein_crop.ravel() * PROTEIN_CALIBRATION_K
+    lipid_raw = lipid_crop.ravel() * LIPID_CALIBRATION_K
+    protein, lipid = remove_outliers(protein_raw, lipid_raw)
+    n_outliers = protein_raw.size - protein.size
+    mean_protein = float(protein.mean())
+    mean_lipid = float(lipid.mean())
+
+    return thumb, (x0, y0, x1, y1), protein, lipid, mean_protein, mean_lipid, n_outliers
+
+
+def build_combined_distribution_plot(region_results, max_points_per_region=5000):
+    """Overlay every selected region's protein-vs-lipid pixel distribution on one
+    large kdeplot, colored and labeled by region so regions can be compared directly."""
+    rng = np.random.default_rng(0)
+    frames = []
+    for i, r in enumerate(region_results):
+        protein, lipid = r['protein'], r['lipid']
+        if protein.size > max_points_per_region:
+            idx = rng.choice(protein.size, max_points_per_region, replace=False)
+            protein, lipid = protein[idx], lipid[idx]
+        frames.append(pd.DataFrame({'protein': protein, 'lipid': lipid, 'region': f'Region {i + 1}'}))
+    combined_df = pd.concat(frames, ignore_index=True)
+
+    palette = {f'Region {i + 1}': REGION_COLORS[i % len(REGION_COLORS)] for i in range(len(region_results))}
+
+    fig, ax = plt.subplots(figsize=(4.0625, 3.75))
+    try:
+        sns.kdeplot(
+            data=combined_df, x='protein', y='lipid', hue='region', palette=palette,
+            levels=6, thresh=0.05, linewidths=1.6, ax=ax,
+        )
+    except Exception:
+        sns.scatterplot(
+            data=combined_df, x='protein', y='lipid', hue='region', palette=palette,
+            s=8, alpha=0.35, linewidth=0, ax=ax,
+        )
+    if ax.get_legend() is not None:
+        sns.move_legend(ax, 'center left', bbox_to_anchor=(1.02, 0.5), frameon=True, title=None)
+    ax.set_xlabel('Protein')
+    ax.set_ylabel('Lipid')
+    ax.grid(True, linewidth=0.5, alpha=0.4)
+    ax.set_axisbelow(True)
+    subsampled = any(r['protein'].size > max_points_per_region for r in region_results)
+    subtitle = f'{len(region_results)} region(s)'
+    if subsampled:
+        subtitle += f'  ·  each capped to {max_points_per_region} px for plotting'
+    ax.set_title(subtitle, fontsize=10)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert('RGB')
+
+
 def build_umap_figure(umap_df, group, task, model_name):
     fig = go.Figure(data=[
         go.Scatter(
@@ -470,6 +634,10 @@ def main_page_layout(default_base_dir):
                 ),
                 html.A(
                     'Whole-image overlay', id='overlay-link', href='#', target='_blank',
+                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
+                ),
+                html.A(
+                    'Image viewer', id='image-viewer-link', href='#', target='_blank',
                     className='btn-primary', style={'background': 'var(--color-text-muted)'},
                 ),
             ]),
@@ -678,6 +846,109 @@ def whole_image_overlay_page_layout(base_dir, group, task, model):
     ])
 
 
+def image_viewer_page_layout(base_dir, group, task):
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
+        return html.Div(className='app-shell', children=[
+            html.A('← Back to explorer', href='/', className='btn-outline'),
+            html.Div(className='app-header', children=[
+                html.H2('Image viewer'),
+                html.P('Missing or invalid data folder / group / task. Go back and select them first.'),
+            ]),
+        ])
+
+    images = list_data_tif_images(base_dir, group)
+    data_group_dir = os.path.join(base_dir, 'data', group)
+
+    return html.Div(className='app-shell', children=[
+        html.A('← Back to explorer', href='/', className='btn-outline'),
+        html.Div(className='app-header', children=[
+            html.H2('Image viewer'),
+            html.P(f'{group} / {task}'),
+        ]),
+
+        dcc.Store(id='viewer-context-store', data={
+            'base_dir': base_dir, 'group': group, 'task': task,
+        }),
+
+        html.Div(className='card', children=[
+            html.Div('Selection', className='card-title'),
+            html.Div(f'Looking for images in: {data_group_dir}', className='status-text'),
+            html.Div(className='field-row', style={'marginTop': '14px'}, children=[
+                html.Div([
+                    html.Label('Image', className='field-label'),
+                    dcc.Dropdown(
+                        id='viewer-image-dropdown',
+                        options=[{'label': img, 'value': img} for img in images],
+                        value=images[0] if images else None,
+                    ),
+                ]),
+                html.Div([
+                    html.Label('Size (% of original)', className='field-label'),
+                    dcc.Input(
+                        id='viewer-scale-input', type='number', value=25, min=1, max=500,
+                        className='dash-input',
+                    ),
+                ]),
+            ]),
+            html.Div(
+                'No .tif images found under this group.', className='status-text status-error',
+            ) if not images else None,
+            html.Button(
+                'Show image', id='viewer-show-button', n_clicks=0,
+                className='btn-primary btn-secondary',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Image', className='card-title'),
+            html.Div(id='viewer-status', className='status-text'),
+            html.Div([
+                'Left-click the image to zoom in, right-click to zoom out (10% per click). ',
+                html.Span('Zoom: 100%', id='viewer-zoom-readout'),
+            ], className='status-text'),
+            html.Div(className='field-row', style={'marginTop': '10px', 'alignItems': 'center'}, children=[
+                html.Button(
+                    'Select region', id='viewer-select-mode-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+                html.Button(
+                    'Clear regions', id='viewer-clear-regions-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+                html.Div(
+                    'Drag on the image to pick a region (repeat to pick several); each '
+                    "one's protein/lipid distribution is plotted below.",
+                    className='status-text', style={'marginTop': 0},
+                ),
+            ]),
+            dcc.Input(id='viewer-region-input', type='text', value='[]', style={'display': 'none'}),
+            html.Div(className='plot-wrap', style={'marginTop': '12px'}, children=[
+                html.Div(className='plot-toolbar', children=[
+                    html.Button(
+                        '⎘', title='Copy image', className='plot-icon-btn plot-copy-btn',
+                        **{'data-filename': 'nori_image'},
+                    ),
+                    html.Button(
+                        '⬇', title='Download image', className='plot-icon-btn plot-download-btn',
+                        **{'data-filename': 'nori_image'},
+                    ),
+                ]),
+                html.Div(className='zoom-scroll', children=[
+                    html.Div(className='zoom-image-wrap', children=[
+                        html.Img(id='viewer-image', className='zoom-image'),
+                    ]),
+                ]),
+            ]),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Selected regions — protein / lipid distribution', className='card-title'),
+            html.Div(id='region-plot-status', className='status-text'),
+            html.Div(id='viewer-regions-container', className='region-list'),
+        ]),
+    ])
+
+
 def create_app(default_base_dir=None):
     assets_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
     app = dash.Dash(__name__, assets_folder=assets_folder, suppress_callback_exceptions=True)
@@ -712,6 +983,8 @@ def register_callbacks(app, default_base_dir):
         if pathname == '/whole-image-overlay':
             model = params.get('model', [''])[0]
             return whole_image_overlay_page_layout(base_dir, group, task, model)
+        if pathname == '/image-viewer':
+            return image_viewer_page_layout(base_dir, group, task)
         return main_page_layout(default_base_dir)
 
     @app.callback(
@@ -738,6 +1011,18 @@ def register_callbacks(app, default_base_dir):
             return '#'
         query = urlencode({'base_dir': base_dir, 'group': group, 'task': task, 'model': model})
         return f'/whole-image-overlay?{query}'
+
+    @app.callback(
+        Output('image-viewer-link', 'href'),
+        Input('base-dir-store', 'data'),
+        Input('group-dropdown', 'value'),
+        Input('task-dropdown', 'value'),
+    )
+    def update_image_viewer_link(base_dir, group, task):
+        if not (base_dir and group and task):
+            return '#'
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
+        return f'/image-viewer?{query}'
 
     @app.callback(
         Output('overlay-status', 'children'),
@@ -770,6 +1055,120 @@ def register_callbacks(app, default_base_dir):
             f'Loaded: {tif_path}  ·  Tile size: {tile_size}px (auto-detected)', className='status-ok',
         )
         return status, img_src
+
+    @app.callback(
+        Output('viewer-status', 'children'),
+        Output('viewer-image', 'src'),
+        Input('viewer-show-button', 'n_clicks'),
+        State('viewer-image-dropdown', 'value'),
+        State('viewer-scale-input', 'value'),
+        State('viewer-context-store', 'data'),
+    )
+    def update_viewer_image(n_clicks, rel_image_path, scale, context):
+        if not (n_clicks and context and rel_image_path):
+            return dash.no_update, dash.no_update
+
+        try:
+            scale = float(scale) / 100
+        except (TypeError, ValueError):
+            scale = 0.25
+
+        try:
+            pil_img, tif_path = build_plain_nori_image(
+                context['base_dir'], context['group'], context['task'], rel_image_path, scale=scale,
+            )
+        except Exception:
+            return html.Pre(traceback.format_exc(), className='metrics-box'), None
+
+        status = html.Span(
+            f'Loaded: {tif_path}  ·  {pil_img.width}×{pil_img.height}px ({round(scale * 100)}%)',
+            className='status-ok',
+        )
+        return status, pil_to_data_uri(pil_img)
+
+    @app.callback(
+        Output('region-plot-status', 'children'),
+        Output('viewer-regions-container', 'children'),
+        Input('viewer-region-input', 'value'),
+        State('viewer-image-dropdown', 'value'),
+        State('viewer-context-store', 'data'),
+    )
+    def update_regions(region_json, rel_image_path, context):
+        if not (rel_image_path and context):
+            return dash.no_update, dash.no_update
+
+        try:
+            bboxes = json.loads(region_json) if region_json else []
+        except (TypeError, ValueError):
+            return dash.no_update, dash.no_update
+
+        if not bboxes:
+            return '', []
+
+        region_results = []
+        try:
+            for bbox in bboxes:
+                thumb, px_bbox, protein, lipid, mean_protein, mean_lipid, n_outliers = (
+                    build_region_analysis(
+                        context['base_dir'], context['group'], context['task'], rel_image_path, bbox,
+                    )
+                )
+                region_results.append({
+                    'thumb': thumb, 'px_bbox': px_bbox,
+                    'protein': protein, 'lipid': lipid,
+                    'mean_protein': mean_protein, 'mean_lipid': mean_lipid, 'n_outliers': n_outliers,
+                })
+        except Exception:
+            return html.Pre(traceback.format_exc(), className='metrics-box'), []
+
+        cards = []
+        for i, r in enumerate(region_results):
+            color = REGION_COLORS[i % len(REGION_COLORS)]
+            x0, y0, x1, y1 = r['px_bbox']
+            cards.append(html.Div(className='region-card', children=[
+                html.Div(className='region-card-header', children=[
+                    html.Span(str(i + 1), className='region-card-badge', style={'background': color}),
+                    html.Div([
+                        html.Span(
+                            f'x[{x0}:{x1}]  y[{y0}:{y1}]  ({r["protein"].size} px, '
+                            f'{r["n_outliers"]} outlier px removed)',
+                            className='region-card-title',
+                        ),
+                        html.Div(
+                            f'mean protein {r["mean_protein"]:.1f}  ·  mean lipid {r["mean_lipid"]:.1f}',
+                            className='status-text', style={'marginTop': '2px'},
+                        ),
+                    ]),
+                ]),
+                html.Div(className='region-thumb-wrap', children=[
+                    plot_with_toolbar(
+                        html.Img(src=pil_to_data_uri(r['thumb']), className='region-thumb-img'),
+                        f'region_{i + 1}_thumbnail',
+                    ),
+                ]),
+            ]))
+
+        if region_results:
+            combined_dist = build_combined_distribution_plot(region_results)
+            cards.append(html.Div(className='region-card region-combined-card', children=[
+                html.Div(className='region-card-header', children=[
+                    html.Span('All', className='region-card-badge', style={'background': '#1a1d23'}),
+                    html.Span('Combined distribution — all regions overlaid', className='region-card-title'),
+                ]),
+                plot_with_toolbar(
+                    html.Img(
+                        src=pil_to_data_uri(combined_dist), className='umap-card-img',
+                        style={'width': '62.5%'},
+                    ),
+                    'all_regions_combined_distribution',
+                ),
+            ]))
+
+        total_pixels = sum(r['protein'].size for r in region_results)
+        status = html.Span(
+            f'{len(region_results)} region(s) selected · {total_pixels} px total', className='status-ok',
+        )
+        return status, cards
 
     @app.callback(
         Output('base-dir-store', 'data'),
