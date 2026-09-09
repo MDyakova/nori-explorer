@@ -382,28 +382,58 @@ a.btn-outline:hover {
   cursor: crosshair;
 }
 
-.region-box {
+/* Rectangle/polygon region overlay, drawn in one SVG per .zoom-image-wrap so both
+   shapes can share the same finalized/draft styling and stay aligned at any zoom. */
+.region-overlay-svg {
   position: absolute;
-  display: none;
-  border: 2px dashed var(--color-primary);
-  background: rgba(15, 118, 110, 0.12);
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
-  box-sizing: border-box;
-}
-
-.region-box.region-draft-box {
-  z-index: 2;
-}
-
-.region-box.region-final-box {
-  display: block;
+  overflow: visible;
   z-index: 1;
 }
 
-.region-box-badge {
+.region-shape {
+  box-sizing: border-box;
+}
+
+.region-draft-shape {
+  fill: rgba(15, 118, 110, 0.12);
+  stroke: var(--color-primary);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Plain HTML dots (not SVG, so their size doesn't scale with image zoom). */
+.region-draft-vertex {
   position: absolute;
-  top: -1px;
-  left: -1px;
+  width: 8px;
+  height: 8px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: var(--color-primary);
+  border: 1.5px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.region-draft-vertex-first {
+  background: #fff;
+  border-color: var(--color-primary);
+}
+
+.region-final-shape {
+  fill: transparent;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.region-badge {
+  position: absolute;
   min-width: 18px;
   height: 18px;
   padding: 0 4px;
@@ -415,6 +445,9 @@ a.btn-outline:hover {
   line-height: 18px;
   text-align: center;
   font-family: var(--font-sans);
+  transform: translate(-1px, -1px);
+  pointer-events: none;
+  z-index: 2;
 }
 
 /* Cards listing per-region thumbnail + protein/lipid distribution */
@@ -456,6 +489,29 @@ a.btn-outline:hover {
   font-size: 13px;
   font-weight: 600;
   color: var(--color-text);
+}
+
+.region-delete-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.region-delete-btn:hover {
+  background: #fef2f2;
+  border-color: #be123c;
+  color: #be123c;
 }
 
 .region-thumb-wrap {

@@ -30,6 +30,7 @@ import pandas as pd
 import plotly.graph_objs as go
 import seaborn as sns
 from dash import Input, Output, State, dcc, html
+from matplotlib.path import Path as MplPath
 from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix, mean_absolute_error, r2_score
 from tifffile import TiffFile
@@ -470,6 +471,44 @@ def channel_color(name, palette_i):
     return CHANNEL_COLOR_PALETTE[palette_i % len(CHANNEL_COLOR_PALETTE)]
 
 
+NORM_MODE_GLOBAL = 'global'
+NORM_MODE_PER_IMAGE = 'per_image'
+NORM_MODE_OPTIONS = [
+    {
+        'label': 'Protein/lipid: calibration file max (max_values.csv)',
+        'value': NORM_MODE_GLOBAL,
+    },
+    {
+        'label': "Every channel: this image's own max after filtering",
+        'value': NORM_MODE_PER_IMAGE,
+    },
+]
+
+
+def channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l):
+    """Normalization divisor for one channel's display intensity (composite image and
+    its colorbar) — purely a display scale, independent of the calibrated protein/lipid
+    values (mg/mL) computed elsewhere.
+    - NORM_MODE_GLOBAL: protein/lipid are divided by the calibration file's max
+      (max_values.csv, shared across every image in the task) so intensities are
+      comparable image-to-image; any other channel is stretched to its own
+      99.5th-percentile intensity in the raw image.
+    - NORM_MODE_PER_IMAGE: every channel (including protein/lipid) is stretched to its
+      own max value after image_filter's per-image outlier clipping, i.e. the same
+      filtered layer compose_channels actually displays — so each image uses its own
+      full display range regardless of the calibration file."""
+    if norm_mode == NORM_MODE_PER_IMAGE:
+        filtered = image_filter(image[idx:idx + 1].astype(float))[0]
+        value = float(filtered.max())
+        return value if value > 0 else 1.0
+    if name == 'protein':
+        return max_p
+    if name == 'lipid':
+        return max_l
+    value = float(np.percentile(image[idx], 99.5))
+    return value if value > 0 else 1.0
+
+
 def compose_channels(image, channel_indices, channel_names, channel_norm_max):
     """Additively blend the given channel indices of a (C, H, W) raw image array into
     one (H, W, 3) float composite in [0, 1]. Each channel is tinted by its own color —
@@ -494,14 +533,17 @@ def compose_channels(image, channel_indices, channel_names, channel_norm_max):
     return np.clip(composite, 0, 1)
 
 
-def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0, channel_indices=None):
+def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0, channel_indices=None,
+                            norm_mode=NORM_MODE_GLOBAL):
     """Render a color composite for one whole-slide .tif, resized to `scale` of its
     original size. channel_indices (a list, e.g. [0], [0, 1], [0, 1, 2, 3]) picks which
     raw channels (see channels.txt) to show — each is tinted by its own color (protein
     red, lipid green by default; other channels cycle through a fixed palette) and
     additively blended into one RGB image, so any number of channels can be shown.
-    Also returns {channel_idx: normalization_max} so a caller can build matching
-    colorbars without re-reading the tif or redoing the percentile computation."""
+    norm_mode (NORM_MODE_GLOBAL or NORM_MODE_PER_IMAGE) picks how each channel's display
+    intensity is normalized — see channel_norm_max_value. Also returns
+    {channel_idx: normalization_max} so a caller can build matching colorbars without
+    re-reading the tif or redoing the percentile computation."""
     tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
     channel_names = load_channel_names(base_dir, group, task)
     max_p, max_l = load_max_values(base_dir, group, task)
@@ -513,17 +555,8 @@ def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0, cha
     channel_max_values = {}
 
     def channel_norm_max(idx):
-        # protein/lipid have a precomputed, quantitatively meaningful max in
-        # max_values.csv; any other channel just gets stretched to its own
-        # 99.5th-percentile intensity for display.
         name = channel_names.get(idx, '').lower()
-        if name == 'protein':
-            value = max_p
-        elif name == 'lipid':
-            value = max_l
-        else:
-            value = float(np.percentile(image[idx], 99.5))
-            value = value if value > 0 else 1.0
+        value = channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l)
         channel_max_values[idx] = value
         return value
 
@@ -598,12 +631,38 @@ def remove_outliers_1d(values, k=1.5):
     return values[mask] if mask.sum() >= 2 else values
 
 
-def build_region_analysis(base_dir, group, task, rel_image_path, bbox, max_thumb_px=220,
-                           channel_indices=None):
-    """For a fractional bbox (values in [0, 1], relative to the image's own width/height),
-    return a composite thumbnail of the cropped region — showing every channel in
-    channel_indices (default: protein/lipid), tinted/blended the same way as the main
-    viewer — plus its (outlier-removed, calibrated) protein/lipid pixel values and means."""
+def region_bbox_and_mask(points, kind, w, h):
+    """points: list of {'x': frac, 'y': frac} in [0, 1] (relative to the image's own
+    width/height). Returns the pixel bounding box (x0, y0, x1, y1) plus a boolean mask
+    over that box selecting the pixels actually inside the region — None for a
+    rectangle (the whole crop is the region), or a polygon-shaped mask for a polygon."""
+    xs = [p['x'] * w for p in points]
+    ys = [p['y'] * h for p in points]
+    x0 = int(np.clip(round(min(xs)), 0, w))
+    x1 = int(np.clip(round(max(xs)), 0, w))
+    y0 = int(np.clip(round(min(ys)), 0, h))
+    y1 = int(np.clip(round(max(ys)), 0, h))
+
+    if kind != 'polygon':
+        return x0, y0, x1, y1, None
+
+    poly_path = MplPath(list(zip(xs, ys)))
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    sample_points = np.column_stack((xx.ravel() + 0.5, yy.ravel() + 0.5))
+    mask = poly_path.contains_points(sample_points).reshape(yy.shape) if xx.size else np.zeros(xx.shape, dtype=bool)
+    return x0, y0, x1, y1, mask
+
+
+def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thumb_px=220,
+                           channel_indices=None, norm_mode=NORM_MODE_GLOBAL):
+    """For a region — {'type': 'rect', 'points': [{x0,y0}, {x1,y1}]} or
+    {'type': 'polygon', 'points': [{x,y}, ...]} (all fractional, relative to the image's
+    own width/height) — return a composite thumbnail of the cropped region (pixels
+    outside a polygon are blacked out) — showing every channel in channel_indices
+    (default: protein/lipid), tinted/blended the same way as the main viewer (norm_mode
+    picks the same display normalization — see channel_norm_max_value) — plus its
+    (outlier-removed, calibrated) protein/lipid pixel values and means, which are always
+    computed from raw pixel intensities and unaffected by norm_mode."""
     tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
     channel_names = load_channel_names(base_dir, group, task)
     max_p, max_l = load_max_values(base_dir, group, task)
@@ -615,25 +674,18 @@ def build_region_analysis(base_dir, group, task, rel_image_path, bbox, max_thumb
         image = tif.asarray()
 
     h, w = image[0].shape
-    x0 = int(np.clip(round(bbox['x0'] * w), 0, w))
-    x1 = int(np.clip(round(bbox['x1'] * w), 0, w))
-    y0 = int(np.clip(round(bbox['y0'] * h), 0, h))
-    y1 = int(np.clip(round(bbox['y1'] * h), 0, h))
-    x0, x1 = sorted((x0, x1))
-    y0, y1 = sorted((y0, y1))
-    if x1 - x0 < 2 or y1 - y0 < 2:
+    x0, y0, x1, y1, mask = region_bbox_and_mask(region['points'], region.get('type', 'rect'), w, h)
+    if x1 - x0 < 2 or y1 - y0 < 2 or (mask is not None and mask.sum() < 4):
         raise ValueError('Selected region is too small to analyze.')
 
     def channel_norm_max(idx):
         name = channel_names.get(idx, '').lower()
-        if name == 'protein':
-            return max_p
-        if name == 'lipid':
-            return max_l
-        value = float(np.percentile(image[idx], 99.5))
-        return value if value > 0 else 1.0
+        return channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l)
 
     image_crop = image[:, y0:y1, x0:x1]
+    if mask is not None:
+        image_crop = image_crop.copy()
+        image_crop[:, ~mask] = 0
     composite = compose_channels(image_crop, channel_indices, channel_names, channel_norm_max)
     thumb = Image.fromarray((composite * 255).astype(np.uint8))
     thumb_scale = min(1.0, max_thumb_px / max(thumb.width, thumb.height))
@@ -643,10 +695,12 @@ def build_region_analysis(base_dir, group, task, rel_image_path, bbox, max_thumb
             resample=Image.LANCZOS,
         )
 
-    protein_crop = image[protein_idx][y0:y1, x0:x1].astype(float)
-    lipid_crop = image[lipid_idx][y0:y1, x0:x1].astype(float)
-    protein_raw = protein_crop.ravel() * PROTEIN_CALIBRATION_K
-    lipid_raw = lipid_crop.ravel() * LIPID_CALIBRATION_K
+    def masked_values(idx):
+        crop = image[idx][y0:y1, x0:x1].astype(float)
+        return crop[mask] if mask is not None else crop.ravel()
+
+    protein_raw = masked_values(protein_idx) * PROTEIN_CALIBRATION_K
+    lipid_raw = masked_values(lipid_idx) * LIPID_CALIBRATION_K
     protein, lipid = remove_outliers(protein_raw, lipid_raw)
     n_outliers = protein_raw.size - protein.size
     mean_protein = float(protein.mean())
@@ -661,7 +715,7 @@ def build_region_analysis(base_dir, group, task, rel_image_path, bbox, max_thumb
         if idx in (protein_idx, lipid_idx):
             continue
         name = channel_names.get(idx, str(idx))
-        values = remove_outliers_1d(image[idx][y0:y1, x0:x1].astype(float).ravel())
+        values = remove_outliers_1d(masked_values(idx))
         extra_channels.append((name, values))
 
     return thumb, (x0, y0, x1, y1), protein, lipid, mean_protein, mean_lipid, n_outliers, extra_channels
@@ -719,8 +773,8 @@ def build_region_boxplot(region_results):
     Each subplot groups that channel's outlier-removed values by region. Sized to match
     build_combined_distribution_plot's KDE plot, since the two are shown stacked."""
     channel_data = [
-        ('Protein', [r['protein'] for r in region_results]),
-        ('Lipid', [r['lipid'] for r in region_results]),
+        ('Protein (mg/mL)', [r['protein'] for r in region_results]),
+        ('Lipid (mg/mL)', [r['lipid'] for r in region_results]),
     ]
     extra_names = [name for name, _ in region_results[0]['extra_channels']]
     for i, name in enumerate(extra_names):
@@ -1099,13 +1153,6 @@ def image_viewer_page_layout(base_dir, group, task):
                     ),
                 ]),
                 html.Div([
-                    html.Label('Size (% of original)', className='field-label'),
-                    dcc.Input(
-                        id='viewer-scale-input', type='number', value=25, min=1, max=500,
-                        className='dash-input',
-                    ),
-                ]),
-                html.Div([
                     html.Label('Channels (1 or more)', className='field-label'),
                     dcc.Dropdown(
                         id='viewer-channel-dropdown', options=channel_options,
@@ -1113,6 +1160,15 @@ def image_viewer_page_layout(base_dir, group, task):
                     ),
                 ]),
             ]),
+            html.Div([
+                html.Label('Channel normalization', className='field-label'),
+                dcc.RadioItems(
+                    id='viewer-norm-mode',
+                    options=NORM_MODE_OPTIONS,
+                    value=NORM_MODE_GLOBAL,
+                    labelStyle={'display': 'block'},
+                ),
+            ], style={'marginTop': '14px'}),
             html.Div(
                 'No .tif images found under this group.', className='status-text status-error',
             ) if not images else None,
@@ -1131,7 +1187,11 @@ def image_viewer_page_layout(base_dir, group, task):
             ], className='status-text'),
             html.Div(className='field-row', style={'marginTop': '10px', 'alignItems': 'center'}, children=[
                 html.Button(
-                    'Select region', id='viewer-select-mode-button', n_clicks=0,
+                    'Rectangle', id='viewer-select-rect-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+                html.Button(
+                    'Polygon', id='viewer-select-polygon-button', n_clicks=0,
                     className='btn-outline', style={'flex': '0 0 auto'},
                 ),
                 html.Button(
@@ -1139,8 +1199,9 @@ def image_viewer_page_layout(base_dir, group, task):
                     className='btn-outline', style={'flex': '0 0 auto'},
                 ),
                 html.Div(
-                    'Drag on the image to pick a region (repeat to pick several); each '
-                    "one's protein/lipid distribution is plotted below.",
+                    'Rectangle: drag to draw. Polygon: click each vertex, then double-click '
+                    "(or click the first vertex) to close it, Esc to cancel. Repeat to pick "
+                    "several regions; each one's protein/lipid distribution is plotted below.",
                     className='status-text', style={'marginTop': 0},
                 ),
             ]),
@@ -1292,11 +1353,11 @@ def register_callbacks(app, default_base_dir):
         Output('viewer-channel-colorbars', 'src'),
         Input('viewer-show-button', 'n_clicks'),
         State('viewer-image-dropdown', 'value'),
-        State('viewer-scale-input', 'value'),
         State('viewer-channel-dropdown', 'value'),
+        State('viewer-norm-mode', 'value'),
         State('viewer-context-store', 'data'),
     )
-    def update_viewer_image(n_clicks, rel_image_path, scale, channel_indices, context):
+    def update_viewer_image(n_clicks, rel_image_path, channel_indices, norm_mode, context):
         if not (n_clicks and context and rel_image_path):
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
@@ -1306,24 +1367,22 @@ def register_callbacks(app, default_base_dir):
                 dash.no_update, dash.no_update, None,
             )
 
-        try:
-            scale = float(scale) / 100
-        except (TypeError, ValueError):
-            scale = 0.25
+        scale = 0.25
 
         try:
             pil_img, tif_path, channel_max_values = build_plain_nori_image(
                 context['base_dir'], context['group'], context['task'], rel_image_path, scale=scale,
-                channel_indices=channel_indices,
+                channel_indices=channel_indices, norm_mode=norm_mode or NORM_MODE_GLOBAL,
             )
         except Exception:
             return html.Pre(traceback.format_exc(), className='metrics-box'), None, dash.no_update, None
 
         channel_names = load_channel_names(context['base_dir'], context['group'], context['task'])
         channel_label = ', '.join(channel_names.get(idx, str(idx)) for idx in channel_indices)
+        norm_label = 'per-image max' if norm_mode == NORM_MODE_PER_IMAGE else 'calibration file max'
         status = html.Span(
             f'Loaded: {tif_path}  ·  {pil_img.width}×{pil_img.height}px ({round(scale * 100)}%)  ·  '
-            f'channels: {channel_label}',
+            f'channels: {channel_label}  ·  normalization: {norm_label}',
             className='status-ok',
         )
         colorbars_img = build_channel_colorbars(channel_indices, channel_names, channel_max_values)
@@ -1333,10 +1392,11 @@ def register_callbacks(app, default_base_dir):
         Output('region-plot-status', 'children'),
         Output('viewer-regions-container', 'children'),
         Input('viewer-region-input', 'value'),
-        State('viewer-channel-dropdown', 'value'),
+        Input('viewer-channel-dropdown', 'value'),
+        Input('viewer-norm-mode', 'value'),
         State('viewer-context-store', 'data'),
     )
-    def update_regions(region_json, channel_indices, context):
+    def update_regions(region_json, channel_indices, norm_mode, context):
         if not context:
             return dash.no_update, dash.no_update
 
@@ -1352,14 +1412,15 @@ def register_callbacks(app, default_base_dir):
         try:
             for entry in entries:
                 rel_image_path = entry['image']
+                region = {'type': entry.get('type', 'rect'), 'points': entry['points']}
                 thumb, px_bbox, protein, lipid, mean_protein, mean_lipid, n_outliers, extra_channels = (
                     build_region_analysis(
                         context['base_dir'], context['group'], context['task'], rel_image_path,
-                        entry['bbox'], channel_indices=channel_indices,
+                        region, channel_indices=channel_indices, norm_mode=norm_mode or NORM_MODE_GLOBAL,
                     )
                 )
                 region_results.append({
-                    'thumb': thumb, 'px_bbox': px_bbox, 'image': rel_image_path,
+                    'thumb': thumb, 'px_bbox': px_bbox, 'image': rel_image_path, 'type': region['type'],
                     'protein': protein, 'lipid': lipid,
                     'mean_protein': mean_protein, 'mean_lipid': mean_lipid, 'n_outliers': n_outliers,
                     'extra_channels': extra_channels,
@@ -1371,13 +1432,14 @@ def register_callbacks(app, default_base_dir):
         for i, r in enumerate(region_results):
             color = REGION_COLORS[i % len(REGION_COLORS)]
             x0, y0, x1, y1 = r['px_bbox']
+            shape_label = 'polygon' if r['type'] == 'polygon' else 'rect'
             cards.append(html.Div(className='region-card', children=[
                 html.Div(className='region-card-header', children=[
                     html.Span(str(i + 1), className='region-card-badge', style={'background': color}),
                     html.Div([
                         html.Span(
-                            f'{r["image"]}  ·  x[{x0}:{x1}]  y[{y0}:{y1}]  ({r["protein"].size} px, '
-                            f'{r["n_outliers"]} outlier px removed)',
+                            f'{r["image"]}  ·  {shape_label}  ·  x[{x0}:{x1}]  y[{y0}:{y1}]  '
+                            f'({r["protein"].size} px, {r["n_outliers"]} outlier px removed)',
                             className='region-card-title',
                         ),
                         html.Div(
@@ -1385,6 +1447,10 @@ def register_callbacks(app, default_base_dir):
                             className='status-text', style={'marginTop': '2px'},
                         ),
                     ]),
+                    html.Button(
+                        '✕', title='Delete this region', className='region-delete-btn',
+                        **{'data-region-index': str(i)},
+                    ),
                 ]),
                 html.Div(className='region-thumb-wrap', children=[
                     plot_with_toolbar(
