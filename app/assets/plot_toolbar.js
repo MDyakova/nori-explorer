@@ -183,7 +183,7 @@ function noriFitZoomPct(img) {
 
 document.addEventListener('click', function (event) {
   var img = event.target.closest('.zoom-image');
-  if (!img || noriRegionState.mode) {
+  if (!img || noriRegionState.mode || noriInspectMode) {
     return;
   }
   var pct = Math.min(noriCurrentZoom(img) + NORI_ZOOM_STEP, NORI_ZOOM_MAX);
@@ -597,4 +597,37 @@ document.addEventListener('dblclick', function (event) {
     noriRegionState.polyPoints.pop();
   }
   noriFinishPolygon(wrap);
+});
+
+// --- whole-image overlay: click-to-inspect a tile's heatmap(s) ---
+// When active, a click on the overlay's .zoom-image reports its fractional (0..1)
+// position (via the same noriWrapFraction used for region selection) instead of
+// zooming, so the Python callback can map it back to a tile and load its heatmaps.
+
+var noriInspectMode = false;
+
+document.addEventListener('click', function (event) {
+  if (event.target.closest('#overlay-inspect-button')) {
+    noriInspectMode = !noriInspectMode;
+    var btn = document.getElementById('overlay-inspect-button');
+    btn.classList.toggle('btn-primary', noriInspectMode);
+    btn.classList.toggle('btn-outline', !noriInspectMode);
+    btn.textContent = noriInspectMode ? 'Inspect tile (click to stop)' : 'Inspect tile';
+    document.querySelectorAll('.zoom-scroll').forEach(function (scroller) {
+      scroller.classList.toggle('region-select-active', noriInspectMode);
+    });
+  }
+});
+
+document.addEventListener('click', function (event) {
+  if (!noriInspectMode) {
+    return;
+  }
+  var img = event.target.closest('.zoom-image');
+  var wrap = img ? img.closest('.zoom-image-wrap') : null;
+  if (!wrap) {
+    return;
+  }
+  var frac = noriWrapFraction(wrap, event.clientX, event.clientY);
+  noriSetReactInputValue('overlay-tile-click-input', JSON.stringify({ x: frac.x, y: frac.y, t: Date.now() }));
 });

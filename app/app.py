@@ -382,6 +382,8 @@ def resolve_whole_image_path(base_dir, group, image_name):
 
 ORIGINAL_OVERLAY_FIG_WIDTH = 30
 ORIGINAL_OVERLAY_FIG_HEIGHT = 10
+OVERLAY_PRED_VMIN = 8
+OVERLAY_PRED_VMAX = 26
 
 
 def build_whole_image_overlay(
@@ -436,16 +438,86 @@ def build_whole_image_overlay(
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.imshow(gray_image, cmap='gray')
-    im = ax.imshow(pred_overlay, cmap='jet', alpha=0.45, vmin=8, vmax=26)
-    fig.colorbar(im, ax=ax, label='Prediction')
-    ax.set_title(image_name)
+    ax.imshow(pred_overlay, cmap='jet', alpha=0.45, vmin=OVERLAY_PRED_VMIN, vmax=OVERLAY_PRED_VMAX)
     ax.axis('off')
 
+    # No title/padding baked in: the saved PNG's content must line up pixel-for-pixel
+    # (as a plain fraction-of-width/height) with the original image, so that a click's
+    # fractional position on it can be mapped back to original-image tiles — see
+    # find_tiles_at_fraction.
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=90, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=90, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}', tif_path, tile_size
+
+
+def find_tiles_at_fraction(base_dir, group, task, model_name, image_name, frac_x, frac_y):
+    """Given a click position as a fraction (0..1) of the whole-image overlay's
+    displayed width/height, return every tile (a row of `model_name`'s umap CSV, with
+    its filename/age/x/y) whose tile_size x tile_size box contains that point, ordered
+    top-to-bottom/left-to-right. Tiles are laid out on a grid with a step of
+    tile_size // 2 in each direction (see infer_tile_size), so a given point is
+    typically covered by up to 4 overlapping tiles — fewer only near the image edges."""
+    _, tif_path = resolve_whole_image_path(base_dir, group, image_name)
+    if tif_path is None:
+        return []
+
+    with TiffFile(tif_path) as tif:
+        image = tif.asarray()
+    height, width = image.shape[1], image.shape[2]
+    click_x = frac_x * width
+    click_y = frac_y * height
+
+    umap_df_im = add_tile_xy(get_tiles_for_image(base_dir, group, task, model_name, image_name))
+    tile_size = infer_tile_size(umap_df_im)
+    if tile_size is None:
+        return []
+
+    matches = umap_df_im[
+        (umap_df_im['x'] <= click_x) & (click_x < umap_df_im['x'] + tile_size) &
+        (umap_df_im['y'] <= click_y) & (click_y < umap_df_im['y'] + tile_size)
+    ].sort_values(['y', 'x'])
+
+    return [
+        {'filename': row['filename'], 'age': row['age'], 'x': int(row['x']), 'y': int(row['y'])}
+        for _, row in matches.iterrows()
+    ]
+
+
+def collect_tile_heatmaps(base_dir, group, task, model_name, tiles):
+    """The heatmap image path for each of the given tiles (in `model_name`'s heatmaps
+    folder), skipping any tile whose heatmap file isn't actually on disk."""
+    heatmaps = []
+    for tile in tiles:
+        rel_path = os.path.join(
+            'outputs', group, task, 'heatmaps', model_name, str(tile['age']), tile['filename'],
+        )
+        if os.path.isfile(os.path.join(base_dir, rel_path)):
+            heatmaps.append({
+                'filename': tile['filename'], 'x': tile['x'], 'y': tile['y'], 'path': rel_path,
+            })
+    return heatmaps
+
+
+def build_overlay_colorbar():
+    """Standalone 'Prediction' colorbar for the whole-image overlay, matching the jet
+    colormap/range used to render the overlay itself — rendered as its own image next
+    to the main overlay image, rather than baked into it, so the zoom pixel coordinates
+    on that image stay untouched (matches how build_channel_colorbars works for the
+    Image viewer)."""
+    fig, ax = plt.subplots(figsize=(0.7, 1.75), constrained_layout=True)
+    norm = matplotlib.colors.Normalize(vmin=OVERLAY_PRED_VMIN, vmax=OVERLAY_PRED_VMAX)
+    cbar = fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap='jet'), cax=ax)
+    cbar.set_label('Prediction', fontsize=8)
+    cbar.ax.tick_params(labelsize=6)
+    cbar.ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=4))
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert('RGB')
 
 
 # protein/lipid keep their familiar red/green look; any other selected channel cycles
@@ -1074,13 +1146,6 @@ def whole_image_overlay_page_layout(base_dir, group, task, model):
                         value=whole_images[0] if whole_images else None,
                     ),
                 ]),
-                html.Div([
-                    html.Label('Figure scale (%)', className='field-label'),
-                    dcc.Input(
-                        id='overlay-scale-input', type='number', value=100, min=10, max=300,
-                        className='dash-input',
-                    ),
-                ]),
             ]),
             html.Pre(list_error, className='metrics-box') if list_error else None,
             html.Button(
@@ -1092,10 +1157,72 @@ def whole_image_overlay_page_layout(base_dir, group, task, model):
         html.Div(className='card', children=[
             html.Div('Overlay', className='card-title'),
             html.Div(id='overlay-status', className='status-text'),
-            plot_with_toolbar(
-                html.Img(id='overlay-image', className='umap-card-img', style={'marginTop': '12px'}),
-                'whole_image_overlay',
+            html.Div([
+                'Left-click the image to zoom in, right-click to zoom out (10% per click). ',
+                html.Span('Zoom: 100%', id='viewer-zoom-readout'),
+            ], className='status-text'),
+            html.Div(className='field-row', style={'marginTop': '10px', 'alignItems': 'center'}, children=[
+                html.Button(
+                    'Inspect tile', id='overlay-inspect-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+                html.Div(
+                    'When on, clicking the image (instead of zooming) looks up that tile\'s '
+                    'heatmap(s) below, one per model that has one.',
+                    className='status-text', style={'marginTop': 0},
+                ),
+            ]),
+            dcc.Input(id='overlay-tile-click-input', type='text', value='', style={'display': 'none'}),
+            html.Div(className='viewer-image-row', style={'marginTop': '12px'}, children=[
+                html.Div(className='plot-wrap', children=[
+                    html.Div(className='plot-toolbar', children=[
+                        html.Button(
+                            '⎘', title='Copy image', className='plot-icon-btn plot-copy-btn',
+                            **{'data-filename': 'whole_image_overlay'},
+                        ),
+                        html.Button(
+                            '⬇', title='Download image', className='plot-icon-btn plot-download-btn',
+                            **{'data-filename': 'whole_image_overlay'},
+                        ),
+                    ]),
+                    html.Div(className='zoom-scroll', children=[
+                        html.Div(className='zoom-image-wrap', children=[
+                            html.Img(
+                                id='overlay-image', className='zoom-image',
+                                **{'data-image-path': ''},
+                            ),
+                        ]),
+                    ]),
+                ]),
+                html.Img(id='overlay-colorbar', className='viewer-colorbars-img'),
+            ]),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Selected tile — heatmaps', className='card-title'),
+            html.Div(
+                'Turn on "Inspect tile" above and click a point on the overlay image to '
+                'load that tile\'s heatmap(s) here.',
+                id='tile-heatmap-status', className='status-text',
             ),
+            dcc.Store(id='tile-heatmap-store', data={'items': [], 'index': 0}),
+            html.Div(id='tile-heatmap-carousel', style={'display': 'none'}, children=[
+                html.Div(className='field-row', style={'marginTop': '10px', 'alignItems': 'center'}, children=[
+                    html.Button(
+                        '←', id='tile-heatmap-prev-button', n_clicks=0,
+                        className='btn-outline', style={'flex': '0 0 auto'},
+                    ),
+                    html.Div(id='tile-heatmap-label', className='status-text', style={'marginTop': 0}),
+                    html.Button(
+                        '→', id='tile-heatmap-next-button', n_clicks=0,
+                        className='btn-outline', style={'flex': '0 0 auto'},
+                    ),
+                ]),
+                plot_with_toolbar(
+                    html.Img(id='tile-heatmap-img', className='tile-image', style={'marginTop': '10px'}),
+                    'tile_heatmap',
+                ),
+            ]),
         ]),
     ])
 
@@ -1314,37 +1441,143 @@ def register_callbacks(app, default_base_dir):
         query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
         return f'/image-viewer?{query}'
 
+    TILE_HEATMAP_IDLE_STATUS = (
+        'Turn on "Inspect tile" above and click a point on the overlay image to load '
+        'that tile\'s heatmap(s) here.'
+    )
+
     @app.callback(
         Output('overlay-status', 'children'),
         Output('overlay-image', 'src'),
+        Output('overlay-colorbar', 'src'),
+        Output('tile-heatmap-store', 'data', allow_duplicate=True),
+        Output('tile-heatmap-status', 'children', allow_duplicate=True),
         Input('overlay-show-button', 'n_clicks'),
         State('overlay-image-dropdown', 'value'),
-        State('overlay-scale-input', 'value'),
         State('overlay-context-store', 'data'),
+        prevent_initial_call=True,
     )
-    def update_overlay(n_clicks, image_name, scale, context):
+    def update_overlay(n_clicks, image_name, context):
         if not (n_clicks and context and image_name):
-            return dash.no_update, dash.no_update
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-        try:
-            scale = float(scale) / 100
-        except (TypeError, ValueError):
-            scale = 1.0
-        fig_width = ORIGINAL_OVERLAY_FIG_WIDTH * scale
-        fig_height = ORIGINAL_OVERLAY_FIG_HEIGHT * scale
+        cleared_heatmaps = {'items': [], 'index': 0}
 
         try:
             img_src, tif_path, tile_size = build_whole_image_overlay(
                 context['base_dir'], context['group'], context['task'], context['model'], image_name,
-                fig_width=fig_width, fig_height=fig_height,
             )
         except Exception:
-            return html.Pre(traceback.format_exc(), className='metrics-box'), None
+            return (
+                html.Pre(traceback.format_exc(), className='metrics-box'), None, None,
+                cleared_heatmaps, TILE_HEATMAP_IDLE_STATUS,
+            )
 
         status = html.Span(
             f'Loaded: {tif_path}  ·  Tile size: {tile_size}px (auto-detected)', className='status-ok',
         )
-        return status, img_src
+        colorbar_img = build_overlay_colorbar()
+        return (
+            status, img_src, pil_to_data_uri(colorbar_img),
+            cleared_heatmaps, TILE_HEATMAP_IDLE_STATUS,
+        )
+
+    @app.callback(
+        Output('tile-heatmap-store', 'data', allow_duplicate=True),
+        Output('tile-heatmap-status', 'children', allow_duplicate=True),
+        Input('overlay-tile-click-input', 'value'),
+        State('overlay-image-dropdown', 'value'),
+        State('overlay-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_tile_heatmap_store(click_json, image_name, context):
+        if not (click_json and context and image_name):
+            return dash.no_update, dash.no_update
+
+        try:
+            click = json.loads(click_json)
+            frac_x, frac_y = float(click['x']), float(click['y'])
+        except (TypeError, ValueError, KeyError):
+            return dash.no_update, dash.no_update
+
+        try:
+            tiles = find_tiles_at_fraction(
+                context['base_dir'], context['group'], context['task'], context['model'],
+                image_name, frac_x, frac_y,
+            )
+        except Exception:
+            return {'items': [], 'index': 0}, html.Pre(traceback.format_exc(), className='metrics-box')
+
+        if not tiles:
+            return {'items': [], 'index': 0}, html.Span('No tile found at that point.', className='status-error')
+
+        heatmaps = collect_tile_heatmaps(
+            context['base_dir'], context['group'], context['task'], context['model'], tiles,
+        )
+        if not heatmaps:
+            return {'items': [], 'index': 0}, html.Span(
+                f"{len(tiles)} tile(s) found at that point, but no heatmap image files exist for them.",
+                className='status-error',
+            )
+
+        items = []
+        for h in heatmaps:
+            try:
+                heatmap_image = Image.open(os.path.join(context['base_dir'], h['path']))
+                items.append({
+                    'label': f"{h['filename']}  (x={h['x']}, y={h['y']})",
+                    'src': pil_to_data_uri(heatmap_image),
+                })
+            except Exception:
+                continue
+
+        if not items:
+            return {'items': [], 'index': 0}, html.Span(
+                f"{len(tiles)} tile(s) found at that point, but their heatmap file(s) could not be opened.",
+                className='status-error',
+            )
+
+        status = html.Span(f'{len(items)} heatmap(s) at that point', className='status-ok')
+        return {'items': items, 'index': 0}, status
+
+    @app.callback(
+        Output('tile-heatmap-store', 'data', allow_duplicate=True),
+        Input('tile-heatmap-prev-button', 'n_clicks'),
+        Input('tile-heatmap-next-button', 'n_clicks'),
+        State('tile-heatmap-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def move_tile_heatmap_index(prev_clicks, next_clicks, data):
+        items = (data or {}).get('items') or []
+        if not items:
+            return dash.no_update
+
+        triggered = dash.ctx.triggered_id
+        index = (data or {}).get('index', 0)
+        if triggered == 'tile-heatmap-prev-button':
+            index = (index - 1) % len(items)
+        elif triggered == 'tile-heatmap-next-button':
+            index = (index + 1) % len(items)
+        else:
+            return dash.no_update
+
+        return {'items': items, 'index': index}
+
+    @app.callback(
+        Output('tile-heatmap-carousel', 'style'),
+        Output('tile-heatmap-img', 'src'),
+        Output('tile-heatmap-label', 'children'),
+        Input('tile-heatmap-store', 'data'),
+    )
+    def render_tile_heatmap_carousel(data):
+        items = (data or {}).get('items') or []
+        if not items:
+            return {'display': 'none'}, None, ''
+
+        index = (data or {}).get('index', 0) % len(items)
+        item = items[index]
+        label = f"{item['label']}  ({index + 1} / {len(items)})"
+        return {'display': 'block'}, item['src'], label
 
     @app.callback(
         Output('viewer-status', 'children'),
