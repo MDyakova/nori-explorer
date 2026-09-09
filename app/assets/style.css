@@ -184,11 +184,17 @@ a.btn-outline:hover {
 }
 
 /* Per-model plots on the "All model plots" page are shown at half size — the
-   "Predictions by age and sample (all models combined)" plot below them is a sibling,
-   not a .model-card descendant, so it keeps its normal full size. */
+   combined-model summary plots below them (.umap-card-img-75) are siblings, not
+   .model-card descendants, and use their own smaller size instead. */
 .model-card .umap-card-img,
 .model-card .training-img {
   width: 50%;
+}
+
+/* Combined-model summary cards on the "All model plots" page (predictions by age and
+   sample, animal-level separation, median age trend) — shown at 75% size. */
+.umap-card-img-75 {
+  width: 75%;
 }
 
 .training-img-row {

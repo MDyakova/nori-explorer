@@ -32,7 +32,8 @@ import seaborn as sns
 from dash import Input, Output, State, dcc, html
 from matplotlib.path import Path as MplPath
 from PIL import Image
-from sklearn.metrics import classification_report, confusion_matrix, mean_absolute_error, r2_score
+from scipy.stats import gaussian_kde
+from sklearn.metrics import mean_absolute_error, r2_score
 from tifffile import TiffFile
 
 
@@ -127,9 +128,7 @@ def compute_metrics(base_dir, umap_df, group, task):
 
     mae = mean_absolute_error(umap_df['age'], umap_df['prediction'])
     r2 = r2_score(umap_df['age'], umap_df['prediction'])
-    report = classification_report(umap_df['age'], umap_df['pred_class'])
-    conf_matrix = confusion_matrix(umap_df['age'], umap_df['pred_class'])
-    return mae, r2, report, conf_matrix, max_p, max_l
+    return mae, r2, max_p, max_l
 
 
 # --- image helpers ------------------------------------------------------
@@ -289,6 +288,228 @@ def build_combined_prediction_boxplot(base_dir, group, task, model_names):
     for label in ax.get_xticklabels():
         label.set_ha('right')
     ax.grid(True)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}'
+
+
+def overlap_coefficient(x1, x2, n_points=512):
+    """KDE-based overlap coefficient (shared area) between two 1-D samples."""
+    x1 = np.asarray(x1, dtype=float)
+    x2 = np.asarray(x2, dtype=float)
+    if len(x1) < 2 or len(x2) < 2 or np.std(x1) == 0 or np.std(x2) == 0:
+        return np.nan
+    try:
+        kde1 = gaussian_kde(x1)
+        kde2 = gaussian_kde(x2)
+    except np.linalg.LinAlgError:
+        return np.nan
+    lo = min(x1.min(), x2.min())
+    hi = max(x1.max(), x2.max())
+    grid = np.linspace(lo, hi, n_points)
+    return float(np.trapz(np.minimum(kde1(grid), kde2(grid)), grid))
+
+
+def tile_overlap_by_animal(df, animal_col='sample_name', age_col='age', pred_col='prediction', age_pairs=None):
+    """Pairwise tile-distribution overlap between every animal at age1 and every animal at age2.
+
+    age_pairs defaults to consecutive age transitions found in df, rather than a
+    hardcoded kidney-aging schedule, so this generalizes across groups/tasks.
+    """
+    if age_pairs is None:
+        ages = sorted(df[age_col].dropna().unique())
+        age_pairs = list(zip(ages[:-1], ages[1:]))
+
+    results = []
+    for age1, age2 in age_pairs:
+        df1 = df[df[age_col] == age1]
+        df2 = df[df[age_col] == age2]
+
+        animals1 = df1[animal_col].dropna().unique()
+        animals2 = df2[animal_col].dropna().unique()
+
+        for animal1 in animals1:
+            x1 = df1.loc[df1[animal_col] == animal1, pred_col].dropna().values
+
+            for animal2 in animals2:
+                x2 = df2.loc[df2[animal_col] == animal2, pred_col].dropna().values
+
+                if len(x1) < 2 or len(x2) < 2:
+                    continue
+
+                ovl = overlap_coefficient(x1, x2)
+                if np.isnan(ovl):
+                    continue
+
+                results.append({
+                    'comparison': f'{age1}m vs {age2}m',
+                    'young_animal': animal1,
+                    'old_animal': animal2,
+                    'n_young_tiles': len(x1),
+                    'n_old_tiles': len(x2),
+                    'overlap': ovl,
+                    'separation': 1 - ovl,
+                })
+
+    return pd.DataFrame(results)
+
+
+def bootstrap_median_ci(x, n_boot=10000, ci=95, seed=42):
+    x = np.asarray(x)
+    rng = np.random.default_rng(seed)
+
+    boot_medians = np.array([
+        np.median(rng.choice(x, size=len(x), replace=True))
+        for _ in range(n_boot)
+    ])
+
+    alpha = (100 - ci) / 2
+    return (
+        np.median(x),
+        np.percentile(boot_medians, alpha),
+        np.percentile(boot_medians, 100 - alpha),
+    )
+
+
+def build_animal_level_separation_plot(base_dir, group, task, model_names):
+    """Animal-level distribution-separation plot: for each age transition, aggregate
+    tile-level overlap per young animal (averaged across old animals), then bootstrap
+    the median separation by resampling animals - keeping the animal, not the tile, as
+    the unit of replication."""
+    frames = []
+    for model_name in model_names:
+        try:
+            frames.append(load_umap_df(base_dir, group, task, model_name))
+        except Exception:
+            continue
+
+    if not frames:
+        return None
+
+    combined_df = pd.concat(frames, ignore_index=True)
+    combined_df = combined_df.dropna(subset=['age', 'sample_name', 'prediction'])
+    if combined_df.empty:
+        return None
+    combined_df['age'] = combined_df['age'].astype(int)
+
+    ages = sorted(combined_df['age'].unique())
+    age_pairs = list(zip(ages[:-1], ages[1:]))
+    if not age_pairs:
+        return None
+    comparison_order = [f'{age1}m vs {age2}m' for age1, age2 in age_pairs]
+
+    tile_animal_pairs = tile_overlap_by_animal(combined_df, age_pairs=age_pairs)
+    if tile_animal_pairs.empty:
+        return None
+
+    tile_animal_stats = (
+        tile_animal_pairs
+        .groupby(['comparison', 'young_animal'], as_index=False)
+        .agg(overlap=('overlap', 'mean'), separation=('separation', 'mean'))
+    )
+
+    rows = []
+    for comparison in comparison_order:
+        values = tile_animal_stats.loc[tile_animal_stats['comparison'] == comparison, 'separation'].dropna()
+        if values.empty:
+            continue
+        median, ci_low, ci_high = bootstrap_median_ci(values.values)
+        rows.append({'comparison': comparison, 'median': median, 'ci_low': ci_low, 'ci_high': ci_high})
+
+    if not rows:
+        return None
+
+    tile_ci_df = pd.DataFrame(rows)
+    x = np.arange(len(tile_ci_df))
+    yerr = np.vstack([
+        tile_ci_df['median'] - tile_ci_df['ci_low'],
+        tile_ci_df['ci_high'] - tile_ci_df['median'],
+    ])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.errorbar(
+        x, tile_ci_df['median'], yerr=yerr, marker='o', markersize=8, capsize=5,
+        linewidth=2, label='Animal level',
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([c.replace(' vs ', ' → ').replace('m', '') for c in tile_ci_df['comparison']])
+    ax.set_xlabel('Age transition (months)')
+    ax.set_ylabel('Distribution separation (1 − OVL)')
+    ax.set_title('Animal-level prediction distribution separation by age transition')
+    ax.set_ylim(0, 1)
+    ax.grid(axis='y', alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}'
+
+
+def build_animal_median_age_trend_plot(base_dir, group, task, model_names):
+    """Median predicted vs. actual age, computed from one median-prediction value per
+    animal per model (not pooled tiles), so each animal contributes equally regardless
+    of tile count. A single overall median line is drawn across all animals/models, with
+    the underlying per-animal points colored by model so model-level spread is visible."""
+    frames = []
+    for model_name in model_names:
+        try:
+            frame = load_umap_df(base_dir, group, task, model_name)
+        except Exception:
+            continue
+        frame = frame.copy()
+        frame['model_name'] = model_name
+        frames.append(frame)
+
+    if not frames:
+        return None
+
+    combined_df = pd.concat(frames, ignore_index=True)
+    combined_df = combined_df.dropna(subset=['age', 'sample_name', 'prediction'])
+    if combined_df.empty:
+        return None
+    combined_df['age'] = combined_df['age'].astype(int)
+
+    animal_medians = (
+        combined_df
+        .groupby(['sample_name', 'age', 'model_name'], as_index=False)['prediction']
+        .median()
+    )
+
+    age_ticks = sorted(animal_medians['age'].unique())
+    age_min, age_max = age_ticks[0], age_ticks[-1]
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    sns.lineplot(
+        data=animal_medians, x='age', y='prediction',
+        estimator='median', errorbar=None, linewidth=1.5, color='#444444',
+        marker=None, ax=ax, label='Median (all animals)', zorder=1,
+    )
+
+    sns.scatterplot(
+        data=animal_medians, x='age', y='prediction', hue='model_name',
+        s=40, linewidth=0, ax=ax, zorder=2,
+    )
+
+    ax.plot(
+        [age_min, age_max], [age_min, age_max], '--', linewidth=2, color='black',
+        label='Ideal prediction (age = age)', zorder=1,
+    )
+
+    ax.set_xlabel('Age (months)')
+    ax.set_ylabel('Predicted age (months)')
+    ax.set_xticks(age_ticks)
+    ax.set_title('Median predicted age by animal (dots colored by model)')
+    ax.grid(alpha=0.3)
+    ax.legend(title='Model', bbox_to_anchor=(1.02, 0.5), loc='center left', fontsize=8, title_fontsize=8)
+    fig.tight_layout()
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
@@ -1120,9 +1341,41 @@ def all_umaps_page_layout(base_dir, group, task):
         combined_section.append(html.Div(className='card', children=[
             html.Div('Predictions by age and sample (all models combined)', className='card-title'),
             plot_with_toolbar(
-                html.Img(src=combined_src, className='umap-card-img'), 'predictions_by_age_and_sample',
+                html.Img(src=combined_src, className='umap-card-img umap-card-img-75'), 'predictions_by_age_and_sample',
             ) if combined_src
             else html.Pre(combined_error or 'No data available.', className='metrics-box'),
+        ]))
+
+        try:
+            animal_level_src = build_animal_level_separation_plot(base_dir, group, task, model_names)
+        except Exception:
+            animal_level_src = None
+            animal_level_error = traceback.format_exc()
+        else:
+            animal_level_error = None
+
+        combined_section.append(html.Div(className='card', children=[
+            html.Div('Animal-level distribution separation by age transition', className='card-title'),
+            plot_with_toolbar(
+                html.Img(src=animal_level_src, className='umap-card-img umap-card-img-75'), 'animal_level_separation',
+            ) if animal_level_src
+            else html.Pre(animal_level_error or 'No data available.', className='metrics-box'),
+        ]))
+
+        try:
+            age_trend_src = build_animal_median_age_trend_plot(base_dir, group, task, model_names)
+        except Exception:
+            age_trend_src = None
+            age_trend_error = traceback.format_exc()
+        else:
+            age_trend_error = None
+
+        combined_section.append(html.Div(className='card', children=[
+            html.Div('Median predicted age by animal (dots colored by model)', className='card-title'),
+            plot_with_toolbar(
+                html.Img(src=age_trend_src, className='umap-card-img umap-card-img-75'), 'median_predicted_age_by_animal',
+            ) if age_trend_src
+            else html.Pre(age_trend_error or 'No data available.', className='metrics-box'),
         ]))
 
     return html.Div(className='app-shell', children=[
@@ -1837,13 +2090,11 @@ def register_callbacks(app, default_base_dir):
             attn_boxplots_src = None
 
         try:
-            mae, r2, report, conf_matrix, max_p, max_l = compute_metrics(base_dir, umap_df, group, task)
+            mae, r2, max_p, max_l = compute_metrics(base_dir, umap_df, group, task)
             metrics_text = (
                 f'{model_name}\n\n'
                 f'Mean Absolute Error (MAE): {round(mae, 2)}\n'
-                f'R² Score: {round(r2, 2)}\n\n'
-                f'{report}\n'
-                f'Confusion matrix:\n{conf_matrix}'
+                f'R² Score: {round(r2, 2)}'
             )
         except Exception:
             metrics_text = f'{model_name}\n\nError computing metrics:\n\n{traceback.format_exc()}'
