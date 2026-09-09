@@ -1070,7 +1070,39 @@ def all_umaps_page_layout(base_dir, group, task):
     except FileNotFoundError:
         model_names = []
 
-    cards = [build_model_card(base_dir, group, task, model_name) for model_name in model_names]
+    # Every model's card is built and present in the page, but only one is shown at a
+    # time (client-side, see the "All model plots" section of plot_toolbar.js) — the
+    # Prev/Next buttons below just toggle which .model-card is visible.
+    cards = [
+        html.Div(
+            build_model_card(base_dir, group, task, model_name),
+            className='model-card',
+            style={'display': 'block'} if i == 0 else {'display': 'none'},
+            **{'data-model-name': model_name},
+        )
+        for i, model_name in enumerate(model_names)
+    ]
+
+    nav_section = []
+    if model_names:
+        nav_section.append(html.Div(
+            className='field-row',
+            style={'alignItems': 'center', 'marginBottom': '16px'},
+            children=[
+                html.Button(
+                    '←', id='all-models-prev-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+                html.Div(
+                    f'{model_names[0]}  (1 / {len(model_names)})',
+                    id='all-models-nav-label', className='status-text', style={'marginTop': 0},
+                ),
+                html.Button(
+                    '→', id='all-models-next-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+            ],
+        ))
 
     if not cards:
         cards = [html.Div("No models found in this task's umap/ folder.", className='tile-placeholder')]
@@ -1099,8 +1131,9 @@ def all_umaps_page_layout(base_dir, group, task):
             html.H2(f'All model plots — {group} / {task}'),
             html.P(f'{len(model_names)} model(s) found.'),
         ]),
-        html.Div(className='umap-grid', children=cards),
         *combined_section,
+        *nav_section,
+        html.Div(cards),
     ])
 
 

@@ -165,12 +165,6 @@ a.btn-outline:hover {
   color: var(--color-primary-hover);
 }
 
-.umap-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
-  gap: 20px;
-}
-
 .umap-card-title {
   font-size: 13px;
   font-weight: 600;
@@ -187,6 +181,14 @@ a.btn-outline:hover {
 
 .umap-card-kde {
   margin-top: 12px;
+}
+
+/* Per-model plots on the "All model plots" page are shown at half size — the
+   "Predictions by age and sample (all models combined)" plot below them is a sibling,
+   not a .model-card descendant, so it keeps its normal full size. */
+.model-card .umap-card-img,
+.model-card .training-img {
+  width: 50%;
 }
 
 .training-img-row {

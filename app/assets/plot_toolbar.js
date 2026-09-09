@@ -631,3 +631,43 @@ document.addEventListener('click', function (event) {
   var frac = noriWrapFraction(wrap, event.clientX, event.clientY);
   noriSetReactInputValue('overlay-tile-click-input', JSON.stringify({ x: frac.x, y: frac.y, t: Date.now() }));
 });
+
+// --- All model plots: Prev/Next navigation between per-model cards (all of them are
+// rendered on page load; only one .model-card is shown at a time) ---
+
+function noriAllModelsCurrentIndex(cards) {
+  for (var i = 0; i < cards.length; i++) {
+    if (cards[i].style.display !== 'none') {
+      return i;
+    }
+  }
+  return 0;
+}
+
+function noriAllModelsShow(index) {
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.model-card'));
+  var n = cards.length;
+  if (!n) {
+    return;
+  }
+  index = ((index % n) + n) % n;
+  cards.forEach(function (card, i) {
+    card.style.display = i === index ? 'block' : 'none';
+  });
+  var label = document.getElementById('all-models-nav-label');
+  if (label) {
+    var name = cards[index].getAttribute('data-model-name') || '';
+    label.textContent = name + '  (' + (index + 1) + ' / ' + n + ')';
+  }
+}
+
+document.addEventListener('click', function (event) {
+  var isPrev = event.target.closest('#all-models-prev-button');
+  var isNext = event.target.closest('#all-models-next-button');
+  if (!isPrev && !isNext) {
+    return;
+  }
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.model-card'));
+  var index = noriAllModelsCurrentIndex(cards);
+  noriAllModelsShow(index + (isNext ? 1 : -1));
+});
