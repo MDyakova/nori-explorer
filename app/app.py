@@ -32,7 +32,7 @@ import seaborn as sns
 from dash import Input, Output, State, dcc, html
 from matplotlib.path import Path as MplPath
 from PIL import Image
-from scipy.stats import gaussian_kde
+from scipy.stats import gaussian_kde, ttest_ind
 from sklearn.metrics import mean_absolute_error, r2_score
 from tifffile import TiffFile
 
@@ -142,6 +142,18 @@ FEATURE_KINDS = {
 }
 _FEATURE_SUFFIXES = {'main': '.csv', 'nucleolus': '_nucleolus.csv', 'shape': '_shape.csv'}
 
+FEATURE_AGGREGATION_LEVELS = {
+    'tubule': 'Tubules (not aggregated)',
+    'animal_median': 'Animal level (median)',
+    'animal_mean': 'Animal level (mean)',
+    'animal_tubule_median': 'Animal-tubule_type level (median)',
+}
+
+# Per-row bounding-box/id columns lose their meaning once rows are aggregated across
+# tubules (a median bounding box doesn't correspond to any real crop region), so they're
+# dropped rather than averaged whenever an aggregation level other than 'tubule' is used.
+FEATURE_AGG_DROPPED_COLS = {'contour_id', 'label_id', 'min_x', 'min_y', 'max_x', 'max_y', 'step', 'step_n'}
+
 
 def features_dir_path(base_dir, group, task):
     return os.path.join(base_dir, 'outputs', group, task, 'features')
@@ -176,8 +188,10 @@ def list_feature_kinds_available(base_dir, group, task):
     return [kind for kind in FEATURE_KINDS if list_feature_files(base_dir, group, task, kind)]
 
 
-def get_feature_columns(base_dir, group, task, kind):
-    """Column names for `kind`, read from just the first file (schema is shared)."""
+def get_feature_columns(base_dir, group, task, kind, level='tubule'):
+    """Column names for `kind`, read from just the first file (schema is shared). At an
+    aggregated `level`, the bbox/id columns that get dropped by aggregate_feature_table
+    are excluded so they can't be picked for a plot in the first place."""
     files = list_feature_files(base_dir, group, task, kind)
     if not files:
         return []
@@ -187,7 +201,42 @@ def get_feature_columns(base_dir, group, task, kind):
         return []
     if 'file_name_save' in columns and 'sample_name' not in columns:
         columns.append('sample_name')
+    if level != 'tubule':
+        columns = [c for c in columns if c not in FEATURE_AGG_DROPPED_COLS]
     return columns
+
+
+def aggregate_feature_table(df, level):
+    """Collapse the tubule-level table to one row per animal, or per animal x tubule
+    type, matching the project's preference for animal-level statistics over raw,
+    pseudoreplicated tubule counts. Bounding-box/id columns are dropped (see
+    FEATURE_AGG_DROPPED_COLS) rather than averaged."""
+    if level == 'tubule' or df.empty:
+        return df
+
+    if level == 'animal_median':
+        group_cols, agg_func = ['sample_name'], 'median'
+    elif level == 'animal_mean':
+        group_cols, agg_func = ['sample_name'], 'mean'
+    elif level == 'animal_tubule_median':
+        group_cols, agg_func = ['sample_name', 'tubule_type'], 'median'
+    else:
+        return df
+
+    if not all(c in df.columns for c in group_cols):
+        return df
+
+    df = df.drop(columns=[c for c in FEATURE_AGG_DROPPED_COLS if c in df.columns])
+
+    numeric_cols = [c for c in df.columns if c not in group_cols and pd.api.types.is_numeric_dtype(df[c])]
+    other_cols = [c for c in df.columns if c not in group_cols and c not in numeric_cols]
+
+    agg_dict = {c: agg_func for c in numeric_cols}
+    agg_dict.update({c: 'first' for c in other_cols})
+    if not agg_dict:
+        return df[group_cols].drop_duplicates().reset_index(drop=True)
+
+    return df.groupby(group_cols, as_index=False).agg(agg_dict)
 
 
 def load_feature_table(base_dir, group, task, kind):
@@ -745,17 +794,99 @@ def build_feature_tile_crop_image(base_dir, group, task, image_name, min_x, min_
     return pil_img, tif_path, (min_x, min_y, max_x, max_y)
 
 
+def cohens_d(x1, x2):
+    x1 = np.asarray(x1, dtype=float)
+    x2 = np.asarray(x2, dtype=float)
+    n1, n2 = len(x1), len(x2)
+    if n1 < 2 or n2 < 2:
+        return np.nan
+    pooled_var = ((n1 - 1) * x1.var(ddof=1) + (n2 - 1) * x2.var(ddof=1)) / (n1 + n2 - 2)
+    pooled_sd = np.sqrt(pooled_var)
+    if pooled_sd == 0:
+        return np.nan
+    return (x1.mean() - x2.mean()) / pooled_sd
+
+
+def significance_stars(p_value):
+    if np.isnan(p_value):
+        return 'n/a'
+    if p_value < 0.001:
+        return '***'
+    if p_value < 0.01:
+        return '**'
+    if p_value < 0.05:
+        return '*'
+    return 'ns'
+
+
+def ordered_categories(values):
+    """Sort unique category values numerically when possible (so e.g. age groups like
+    '9'/'18'/'21'/'25' come out in age order, not string order), falling back to a plain
+    sort otherwise."""
+    unique_values = pd.unique(values)
+    try:
+        return sorted(unique_values, key=float)
+    except (TypeError, ValueError):
+        return sorted(unique_values, key=str)
+
+
+def annotate_pairwise_stats(ax, plot_df, x_col, y_col, order):
+    """Welch's t-test + Cohen's d between each pair of adjacent x categories (e.g.
+    consecutive age groups), annotated as a bracket above the boxes/violins — a quick,
+    honest read of how strong (and how significant) each step's difference is, without
+    running every pair (which would multiply-test and clutter the plot)."""
+    if not pd.api.types.is_numeric_dtype(plot_df[y_col]) or len(order) < 2:
+        return
+
+    groups = {cat: plot_df.loc[plot_df[x_col] == cat, y_col].dropna().values for cat in order}
+
+    y_max = plot_df[y_col].max()
+    y_min = plot_df[y_col].min()
+    y_range = (y_max - y_min) or abs(y_max) or 1.0
+    step = y_range * 0.08
+    base = y_max + step
+
+    for i in range(len(order) - 1):
+        x1, x2 = groups[order[i]], groups[order[i + 1]]
+        if len(x1) < 2 or len(x2) < 2:
+            continue
+
+        _, p_value = ttest_ind(x1, x2, equal_var=False)
+        d = cohens_d(x1, x2)
+        stars = significance_stars(p_value)
+        d_text = f'd={d:.2f}' if not np.isnan(d) else 'd=n/a'
+
+        y_bracket = base + i * step
+        ax.plot(
+            [i, i, i + 1, i + 1],
+            [y_bracket, y_bracket + step * 0.15, y_bracket + step * 0.15, y_bracket],
+            color='black', linewidth=1, clip_on=False,
+        )
+        ax.text(
+            i + 0.5, y_bracket + step * 0.2, f'{d_text}, {stars}',
+            ha='center', va='bottom', fontsize=8, clip_on=False,
+        )
+
+    ax.set_ylim(top=base + (len(order) - 1) * step + step * 1.5)
+
+
 def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='box'):
     plot_df = filter_feature_rows(df, [x_col, y_col, hue_col])
     if plot_df.empty:
         return None
 
-    n_categories = max(plot_df[x_col].nunique(), 1)
+    order = ordered_categories(plot_df[x_col])
+    n_categories = max(len(order), 1)
     fig, ax = plt.subplots(figsize=(max(7, n_categories * 0.6), 6))
     if plot_type == 'violin':
-        sns.violinplot(data=plot_df, x=x_col, y=y_col, hue=hue_col, cut=0, ax=ax)
+        sns.violinplot(data=plot_df, x=x_col, y=y_col, hue=hue_col, order=order, cut=0, ax=ax)
     else:
-        sns.boxplot(data=plot_df, x=x_col, y=y_col, hue=hue_col, showfliers=False, ax=ax)
+        sns.boxplot(data=plot_df, x=x_col, y=y_col, hue=hue_col, order=order, showfliers=False, ax=ax)
+
+    # Pairwise stats between adjacent x categories only make sense to draw when there's
+    # no hue splitting each category into sub-boxes.
+    if hue_col is None:
+        annotate_pairwise_stats(ax, plot_df, x_col, y_col, order)
 
     ax.set_xlabel(x_col)
     ax.set_ylabel(y_col)
@@ -1715,6 +1846,18 @@ def features_page_layout(base_dir, group, task):
                         value=default_kind,
                     ),
                 ]),
+                html.Div([
+                    html.Label('Aggregation level', className='field-label'),
+                    dcc.Dropdown(
+                        id='features-agg-dropdown',
+                        options=[
+                            {'label': label, 'value': level}
+                            for level, label in FEATURE_AGGREGATION_LEVELS.items()
+                        ],
+                        value='tubule',
+                        clearable=False,
+                    ),
+                ]),
             ]),
             html.Div(id='features-status', className='status-text', style={'marginTop': '10px'}),
         ]),
@@ -2137,15 +2280,18 @@ def register_callbacks(app, default_base_dir):
         Output('box-y-dropdown', 'value'),
         Output('box-hue-dropdown', 'value'),
         Input('features-kind-dropdown', 'value'),
+        Input('features-agg-dropdown', 'value'),
         State('features-context-store', 'data'),
     )
-    def update_feature_columns(kind, context):
+    def update_feature_columns(kind, level, context):
         no_updates = (dash.no_update,) * 12
         if not (kind and context):
             return (html.Span('Select a feature file.', className='status-text'), *no_updates)
 
         try:
-            columns = get_feature_columns(context['base_dir'], context['group'], context['task'], kind)
+            columns = get_feature_columns(
+                context['base_dir'], context['group'], context['task'], kind, level or 'tubule',
+            )
             n_files = len(list_feature_files(context['base_dir'], context['group'], context['task'], kind))
         except Exception:
             return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
@@ -2180,18 +2326,20 @@ def register_callbacks(app, default_base_dir):
         Output('features-scatter-graph', 'figure'),
         Input('features-scatter-button', 'n_clicks'),
         State('features-kind-dropdown', 'value'),
+        State('features-agg-dropdown', 'value'),
         State('scatter-x-dropdown', 'value'),
         State('scatter-y-dropdown', 'value'),
         State('scatter-hue-dropdown', 'value'),
         State('features-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def update_features_scatter(n_clicks, kind, x_col, y_col, hue_col, context):
+    def update_features_scatter(n_clicks, kind, level, x_col, y_col, hue_col, context):
         if not (n_clicks and context and kind and x_col and y_col):
             return dash.no_update, dash.no_update
 
         try:
             df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            df = aggregate_feature_table(df, level or 'tubule')
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), go.Figure()
             fig = build_feature_scatter_figure(df, x_col, y_col, hue_col or None)
@@ -2272,6 +2420,7 @@ def register_callbacks(app, default_base_dir):
         Output('features-box-img', 'src'),
         Input('features-box-button', 'n_clicks'),
         State('features-kind-dropdown', 'value'),
+        State('features-agg-dropdown', 'value'),
         State('box-plot-type-dropdown', 'value'),
         State('box-x-dropdown', 'value'),
         State('box-y-dropdown', 'value'),
@@ -2279,12 +2428,13 @@ def register_callbacks(app, default_base_dir):
         State('features-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def update_features_box(n_clicks, kind, plot_type, x_col, y_col, hue_col, context):
+    def update_features_box(n_clicks, kind, level, plot_type, x_col, y_col, hue_col, context):
         if not (n_clicks and context and kind and x_col and y_col):
             return dash.no_update, dash.no_update
 
         try:
             df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            df = aggregate_feature_table(df, level or 'tubule')
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), None
             img_src = build_feature_box_or_violin_plot(df, x_col, y_col, hue_col or None, plot_type or 'box')

@@ -61,11 +61,13 @@ for the whole-image overlay, `data/`:
   curves) for every model in a task, with a combined prediction-by-sample boxplot.
 - **Whole-image overlay** — renders a selected whole-slide `.tif` with per-tile
   predictions overlaid as a heatmap.
-- **Features** — pick one of the three feature-file kinds (tubule, nucleolus, shape),
-  then build an interactive scatter plot (like the UMAP embedding — click a point to crop
-  and view its protein/lipid region from the source whole-slide image) or a seaborn
-  boxplot/violin plot from any of its columns, with an optional hue column, across every
-  image's feature file in the task.
+- **Features** — pick one of the three feature-file kinds (tubule, nucleolus, shape) and
+  an aggregation level (raw tubules, per-animal median/mean, or per-animal-and-tubule-type
+  median), then build an interactive scatter plot (like the UMAP embedding — click a
+  point to crop and view its protein/lipid region from the source whole-slide image, only
+  available at the tubule level) or a seaborn boxplot/violin plot (with pairwise Welch's
+  t-test + Cohen's d between adjacent x categories) from any of its columns, with an
+  optional hue column, across every image's feature file in the task.
 
 ## License
 
