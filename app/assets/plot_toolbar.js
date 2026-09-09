@@ -671,3 +671,61 @@ document.addEventListener('click', function (event) {
   var index = noriAllModelsCurrentIndex(cards);
   noriAllModelsShow(index + (isNext ? 1 : -1));
 });
+
+// --- results tables: copy (tab-separated, pastes cleanly into a spreadsheet) /
+// download (as a .csv file) ---
+
+function noriTableRows(table) {
+  return Array.prototype.slice.call(table.querySelectorAll('tr')).map(function (tr) {
+    return Array.prototype.slice.call(tr.querySelectorAll('th, td')).map(function (cell) {
+      return cell.textContent.trim();
+    });
+  });
+}
+
+function noriEscapeCsvCell(value) {
+  return /[",\n]/.test(value) ? '"' + value.replace(/"/g, '""') + '"' : value;
+}
+
+function noriTableToDelimited(rows, delimiter, escapeCell) {
+  return rows.map(function (row) {
+    return row.map(escapeCell || function (v) { return v; }).join(delimiter);
+  }).join('\n');
+}
+
+function noriDownloadText(text, filename, mime) {
+  var blob = new Blob([text], { type: mime });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.addEventListener('click', function (event) {
+  var btn = event.target.closest('.table-copy-btn, .table-download-btn');
+  if (!btn) {
+    return;
+  }
+  var wrap = btn.closest('.table-wrap');
+  var table = wrap ? wrap.querySelector('table') : null;
+  if (!table) {
+    return;
+  }
+
+  var rows = noriTableRows(table);
+  var baseFilename = btn.getAttribute('data-filename') || 'table';
+
+  if (btn.classList.contains('table-download-btn')) {
+    noriDownloadText(noriTableToDelimited(rows, ',', noriEscapeCsvCell), baseFilename + '.csv', 'text/csv');
+    noriFlashButton(btn, '✓');
+    return;
+  }
+
+  navigator.clipboard.writeText(noriTableToDelimited(rows, '\t'))
+    .then(function () { noriFlashButton(btn, '✓'); })
+    .catch(function () { noriFlashButton(btn, '✗'); });
+});

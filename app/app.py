@@ -15,6 +15,7 @@ import json
 import os
 import threading
 import traceback
+import warnings
 import webbrowser
 from urllib.parse import parse_qs, urlencode
 
@@ -23,6 +24,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.cm
 import matplotlib.colors
+import matplotlib.patches
 import matplotlib.pyplot as plt
 import matplotlib.ticker
 import numpy as np
@@ -32,9 +34,17 @@ import seaborn as sns
 from dash import Input, Output, State, dcc, html
 from matplotlib.path import Path as MplPath
 from PIL import Image
-from scipy.stats import gaussian_kde, ttest_ind
+from scipy.stats import f as f_distribution
+from scipy.stats import gaussian_kde, kruskal, linregress, mannwhitneyu, spearmanr, ttest_ind
 from sklearn.metrics import mean_absolute_error, r2_score
 from tifffile import TiffFile
+
+try:
+    import statsmodels.formula.api as smf
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    smf = None
+    STATSMODELS_AVAILABLE = False
 
 
 # Mirrors NORI_REGION_COLORS in assets/plot_toolbar.js so a region's badge color here
@@ -266,6 +276,70 @@ def load_feature_table(base_dir, group, task, kind):
     return combined
 
 
+# Columns available for the "Predicted-age trend" plot: the main tubule table's own
+# metrics plus the shape table's morphology metrics, joined on (file_name_save,
+# contour_id == label_id), plus two ratios derived from the main table.
+def list_pred_age_trend_features(base_dir, group, task, pred_col='pred_320'):
+    """Every numeric column in the combined main+shape table (see
+    load_main_shape_merged_table), except identifiers/coordinates and the model's own
+    prediction/attention outputs — pred_col is the x-axis here, so it (and its sibling
+    pred/attn columns) aren't offered as a y-axis feature."""
+    df = load_main_shape_merged_table(base_dir, group, task)
+    if df.empty:
+        return []
+
+    excluded = FEATURE_NON_METRIC_COLS | {
+        pred_col, 'pred_320', 'pred_128',
+        'protein_attn_320', 'lipid_attn_320', 'protein_attn_128', 'lipid_attn_128',
+    }
+    return [
+        c for c in df.columns
+        if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+
+def list_tubule_types(base_dir, group, task):
+    """Distinct tubule_type values, read from just the first main feature file (the set
+    of tubule types is assumed consistent across images in a group/task)."""
+    files = list_feature_files(base_dir, group, task, 'main')
+    if not files:
+        return []
+    try:
+        values = pd.read_csv(files[0][1], usecols=['tubule_type'])['tubule_type']
+    except Exception:
+        return []
+    return sorted(values.dropna().unique().tolist())
+
+
+def load_main_shape_merged_table(base_dir, group, task):
+    """The main tubule-level table left-joined with the shape table on
+    (file_name_save, contour_id == label_id) — the shape table has no bbox/id columns
+    of its own to look up by otherwise, but shares this id with the main table's
+    contour_id. Also derives bb_size_k and lumen_size_k (bb_size / body_size,
+    lumen_size / body_size)."""
+    main_df = load_feature_table(base_dir, group, task, 'main')
+    if main_df.empty:
+        return pd.DataFrame()
+
+    shape_df = load_feature_table(base_dir, group, task, 'shape')
+    if not shape_df.empty and 'contour_id' in main_df.columns and 'label_id' in shape_df.columns:
+        shape_only_cols = [c for c in shape_df.columns if c not in main_df.columns and c != 'label_id']
+        merged = main_df.merge(
+            shape_df[['file_name_save', 'label_id', *shape_only_cols]],
+            left_on=['file_name_save', 'contour_id'], right_on=['file_name_save', 'label_id'],
+            how='left',
+        )
+    else:
+        merged = main_df.copy()
+
+    if {'bb_size', 'body_size'}.issubset(merged.columns):
+        merged['bb_size_k'] = merged['bb_size'] / merged['body_size']
+    if {'lumen_size', 'body_size'}.issubset(merged.columns):
+        merged['lumen_size_k'] = merged['lumen_size'] / merged['body_size']
+
+    return merged
+
+
 # --- image helpers ------------------------------------------------------
 
 def pil_to_data_uri(img):
@@ -289,6 +363,25 @@ def plot_with_toolbar(img, filename):
                 **{'data-filename': filename},
             ),
         ]),
+    ])
+
+
+def table_with_toolbar(table, filename):
+    """Wrap an html.Table with copy/download icon buttons — copy puts a tab-separated
+    version on the clipboard (pastes cleanly into a spreadsheet), download saves a
+    .csv file."""
+    return html.Div(className='table-wrap', children=[
+        html.Div(className='table-toolbar', children=[
+            html.Button(
+                '⎘', title='Copy table (tab-separated)', className='table-icon-btn table-copy-btn',
+                **{'data-filename': filename},
+            ),
+            html.Button(
+                '⬇', title='Download table (CSV)', className='table-icon-btn table-download-btn',
+                **{'data-filename': filename},
+            ),
+        ]),
+        html.Div(table, style={'overflowX': 'auto'}),
     ])
 
 
@@ -906,6 +999,551 @@ def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
+
+
+TUBULE_TYPE_ALL = '__all__'
+
+
+def build_pred_age_trend_plot(df, feature_col, pred_col='pred_320', tubule_type=TUBULE_TYPE_ALL, bin_width=0.2):
+    """Predicted-age trend for one feature, optionally restricted to one tubule type
+    (tubule_type=TUBULE_TYPE_ALL keeps every tubule type): trim outliers (IQR rule) on
+    both the prediction and the feature, bin the prediction into `bin_width`-wide
+    buckets and average within each bucket, then fit+plot a regression line and report
+    the Spearman correlation between the binned prediction and the averaged feature
+    value. Returns (image_data_uri, rho, p_value), or (None, None, None) if there isn't
+    enough data to plot."""
+    if not {pred_col, feature_col}.issubset(df.columns):
+        return None, None, None
+
+    mask = (df[pred_col] >= 5) & (df[pred_col] < 28) & (df[pred_col] != -1)
+    if tubule_type and tubule_type != TUBULE_TYPE_ALL:
+        if 'tubule_type' not in df.columns:
+            return None, None, None
+        mask &= df['tubule_type'] == tubule_type
+
+    a = df[mask]
+    a = filter_feature_rows(a, [pred_col, feature_col])
+    if len(a) < 4:
+        return None, None, None
+
+    lower_p, upper_p = _iqr_bounds(a[pred_col].values)
+    a = a[(a[pred_col] >= lower_p) & (a[pred_col] <= upper_p)]
+
+    lower_c, upper_c = _iqr_bounds(a[feature_col].values)
+    a = a[(a[feature_col] >= lower_c) & (a[feature_col] <= upper_c)]
+    if len(a) < 4:
+        return None, None, None
+
+    binned = a[[pred_col, feature_col]].copy()
+    binned[pred_col] = (binned[pred_col] // bin_width) * bin_width
+    binned = binned.groupby(by=pred_col, as_index=False).mean()
+    if len(binned) < 3:
+        return None, None, None
+
+    rho, p_value = spearmanr(binned[pred_col], binned[feature_col], nan_policy='omit')
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    sns.regplot(
+        data=binned, x=pred_col, y=feature_col,
+        scatter_kws={'s': 15}, line_kws={'color': 'red'}, ax=ax,
+    )
+    ax.set_title(f'{feature_col}\nSpearman R={rho:.3f}, p={p_value:.3g}')
+    ax.set_xlabel('Predicted age')
+    ax.grid(True)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}', rho, p_value
+
+
+# --- statistics page -------------------------------------------------------
+
+# Columns that are identifiers/coordinates, not biological features, and so are
+# excluded when scanning a feature table for "does this differ with age" candidates.
+FEATURE_NON_METRIC_COLS = {'class_name', 'file_name_save', 'sample_name', 'tubule_type', 'nucleolus'} | FEATURE_AGG_DROPPED_COLS
+
+
+def benjamini_hochberg(p_values):
+    """Benjamini-Hochberg FDR-adjusted q-values, same order as the input p-values."""
+    p = np.asarray(p_values, dtype=float)
+    n = len(p)
+    order = np.argsort(p)
+    ranked = p[order]
+    q = ranked * n / (np.arange(n) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0, 1)
+    result = np.empty(n)
+    result[order] = q
+    return result
+
+
+def welch_anova(groups):
+    """One-way ANOVA robust to unequal variances between groups (Welch, 1951).
+    groups: a list of 1-D arrays, one per age group. Returns (F, p_value)."""
+    groups = [np.asarray(g, dtype=float) for g in groups if len(g) >= 2]
+    k = len(groups)
+    if k < 2:
+        return np.nan, np.nan
+
+    n = np.array([len(g) for g in groups], dtype=float)
+    mean = np.array([g.mean() for g in groups])
+    var = np.array([g.var(ddof=1) for g in groups])
+    var = np.where(var == 0, 1e-12, var)
+
+    w = n / var
+    w_sum = w.sum()
+    grand_mean = np.sum(w * mean) / w_sum
+
+    numerator = np.sum(w * (mean - grand_mean) ** 2) / (k - 1)
+    lambda_term = np.sum((1 - w / w_sum) ** 2 / (n - 1))
+    denominator = 1 + (2 * (k - 2) / (k ** 2 - 1)) * lambda_term
+    if denominator <= 0:
+        return np.nan, np.nan
+
+    f_stat = numerator / denominator
+    df1 = k - 1
+    df2 = (k ** 2 - 1) / (3 * lambda_term) if lambda_term > 0 else np.inf
+    p_value = f_distribution.sf(f_stat, df1, df2)
+    return f_stat, p_value
+
+
+def cliffs_delta(x1, x2):
+    """Non-parametric effect size: (#(x1>x2) - #(x1<x2)) / (n1*n2), computed via the
+    Mann-Whitney U statistic (delta = 2*U/(n1*n2) - 1) so it stays fast even for large
+    samples. Same sign convention as cohens_d: positive means x1 (younger) > x2 (older),
+    i.e. the feature decreases with age."""
+    n1, n2 = len(x1), len(x2)
+    if n1 < 1 or n2 < 1:
+        return np.nan
+    try:
+        u_stat, _ = mannwhitneyu(x1, x2, alternative='two-sided')
+    except ValueError:
+        return np.nan
+    return (2 * u_stat) / (n1 * n2) - 1
+
+
+def fit_mixed_effects_age(df, age_col, feature_col, group_col='sample_name'):
+    """Random-intercept mixed model: feature ~ age, with animal (sample_name) as a
+    random effect — lets every tubule contribute while still accounting for which
+    animal it came from, rather than treating tubules as independent replicates.
+    Convergence can fail with few animals or few tubules per animal (a known risk
+    noted in the project's own statistics guidance); reported as a note, not raised."""
+    if not STATSMODELS_AVAILABLE:
+        return np.nan, np.nan, 'statsmodels not installed'
+    if group_col not in df.columns:
+        return np.nan, np.nan, 'no animal column'
+
+    model_df = df[[age_col, feature_col, group_col]].dropna().copy()
+    model_df['age_numeric'] = pd.to_numeric(model_df[age_col], errors='coerce')
+    model_df = model_df.dropna(subset=['age_numeric', feature_col])
+    if model_df[group_col].nunique() < 2 or len(model_df) < 4:
+        return np.nan, np.nan, 'insufficient animals/rows'
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            model = smf.mixedlm(f'Q("{feature_col}") ~ age_numeric', model_df, groups=model_df[group_col])
+            fit = model.fit(reml=False, method='lbfgs')
+        coef = float(fit.params.get('age_numeric', np.nan))
+        p_value = float(fit.pvalues.get('age_numeric', np.nan))
+        note = 'ok' if fit.converged else 'did not converge'
+        return coef, p_value, note
+    except Exception:
+        return np.nan, np.nan, 'failed to fit'
+
+
+def compute_overall_feature_stats(df, age_col='class_name'):
+    """For every numeric feature column, run the full suite of "does this differ across
+    ALL ages" tests: Kruskal-Wallis (non-parametric omnibus), Welch's ANOVA (parametric,
+    robust to unequal variance), Spearman's rho and a simple linear regression (is there
+    a monotonic/linear trend with age), and a random-intercept mixed-effects model
+    (feature ~ age, animal as random effect) so every tubule can be used while still
+    accounting for which animal it came from. Each test's p-values get their own
+    Benjamini-Hochberg q-value across every feature tested here; features are ranked by
+    min(Kruskal-Wallis q, Welch's ANOVA q)."""
+    if age_col not in df.columns:
+        return pd.DataFrame()
+
+    age_order = ordered_categories(df[age_col])
+    feature_cols = [
+        c for c in df.columns
+        if c not in FEATURE_NON_METRIC_COLS and c != age_col and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    has_animal = 'sample_name' in df.columns
+
+    rows = []
+    for col in feature_cols:
+        valid = filter_feature_rows(df, [age_col, col])
+        if valid.empty:
+            continue
+
+        groups = [valid.loc[valid[age_col] == age, col].values for age in age_order]
+        groups = [g for g in groups if len(g) >= 2]
+        if len(groups) < 2:
+            continue
+
+        try:
+            kw_stat, kw_p = kruskal(*groups)
+        except ValueError:
+            kw_stat, kw_p = np.nan, np.nan
+
+        welch_f, welch_p = welch_anova(groups)
+
+        age_numeric = pd.to_numeric(valid[age_col], errors='coerce')
+        feature_values = valid[col].astype(float)
+        trend_mask = age_numeric.notna()
+        if trend_mask.sum() >= 3 and age_numeric[trend_mask].nunique() >= 2:
+            rho, spearman_p = spearmanr(age_numeric[trend_mask], feature_values[trend_mask])
+            lin = linregress(age_numeric[trend_mask], feature_values[trend_mask])
+            slope, r_value, lin_p = lin.slope, lin.rvalue, lin.pvalue
+        else:
+            rho = spearman_p = slope = r_value = lin_p = np.nan
+
+        if has_animal:
+            mixed_coef, mixed_p, mixed_note = fit_mixed_effects_age(valid, age_col, col)
+        else:
+            mixed_coef, mixed_p, mixed_note = np.nan, np.nan, 'no animal column'
+
+        rows.append({
+            'feature': col,
+            'n_groups': len(groups),
+            'n_total': sum(len(g) for g in groups),
+            'kw_stat': kw_stat, 'kw_p': kw_p,
+            'welch_f': welch_f, 'welch_p': welch_p,
+            'spearman_rho': rho, 'spearman_p': spearman_p,
+            'linreg_slope': slope, 'linreg_r': r_value, 'linreg_p': lin_p,
+            'mixed_coef': mixed_coef, 'mixed_p': mixed_p, 'mixed_note': mixed_note,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    result['kw_q'] = benjamini_hochberg(result['kw_p'].fillna(1).values)
+    result['welch_q'] = benjamini_hochberg(result['welch_p'].fillna(1).values)
+    result['spearman_q'] = benjamini_hochberg(result['spearman_p'].fillna(1).values)
+    result['linreg_q'] = benjamini_hochberg(result['linreg_p'].fillna(1).values)
+    result['mixed_q'] = (
+        benjamini_hochberg(result['mixed_p'].fillna(1).values) if result['mixed_p'].notna().any() else np.nan
+    )
+
+    result['q_value'] = result[['kw_q', 'welch_q']].min(axis=1)
+    result['abs_spearman_rho'] = result['spearman_rho'].abs()
+    result['direction'] = np.select(
+        [result['spearman_rho'] > 0, result['spearman_rho'] < 0],
+        ['increases with age', 'decreases with age'],
+        default='n/a',
+    )
+    result['transition'] = None
+
+    result.sort_values(by='q_value', inplace=True)
+    result.reset_index(drop=True, inplace=True)
+    return result
+
+
+def compute_pairwise_feature_stats(df, age_col='class_name'):
+    """For every numeric feature column and every pair of adjacent age groups: Welch's
+    t-test (parametric) and Mann-Whitney U (non-parametric) as a matched pair of
+    significance tests, plus Cohen's d and Cliff's delta as their matching
+    parametric/non-parametric effect sizes — the same adjacent-transitions convention
+    the Features-page boxplot annotates, run exhaustively across every feature.
+    FDR-corrected separately for each p-value column, across every (feature,
+    transition) row; ranked by the Welch's t-test q-value."""
+    if age_col not in df.columns:
+        return pd.DataFrame()
+
+    age_order = ordered_categories(df[age_col])
+    if len(age_order) < 2:
+        return pd.DataFrame()
+
+    feature_cols = [
+        c for c in df.columns
+        if c not in FEATURE_NON_METRIC_COLS and c != age_col and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    rows = []
+    for col in feature_cols:
+        valid = filter_feature_rows(df, [age_col, col])
+        groups = {age: valid.loc[valid[age_col] == age, col].values for age in age_order}
+
+        for i in range(len(age_order) - 1):
+            a1, a2 = age_order[i], age_order[i + 1]
+            x1, x2 = groups[a1], groups[a2]
+            if len(x1) < 2 or len(x2) < 2:
+                continue
+
+            _, welch_p = ttest_ind(x1, x2, equal_var=False)
+            try:
+                _, mw_p = mannwhitneyu(x1, x2, alternative='two-sided')
+            except ValueError:
+                mw_p = np.nan
+            if np.isnan(welch_p) and np.isnan(mw_p):
+                continue
+
+            d = cohens_d(x1, x2)
+            delta = cliffs_delta(x1, x2)
+            if np.isnan(d):
+                direction = 'n/a'
+            else:
+                direction = 'increases with age' if d < 0 else 'decreases with age'
+
+            rows.append({
+                'feature': col,
+                'transition': f'{a1} vs {a2}',
+                'n1': len(x1),
+                'n2': len(x2),
+                'n_total': len(x1) + len(x2),
+                'p_value': welch_p,
+                'mannwhitney_p': mw_p,
+                'cohens_d': d,
+                'max_abs_cohens_d': abs(d) if not np.isnan(d) else np.nan,
+                'cliffs_delta': delta,
+                'direction': direction,
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    result['q_value'] = benjamini_hochberg(result['p_value'].fillna(1).values)
+    result['mannwhitney_q'] = benjamini_hochberg(result['mannwhitney_p'].fillna(1).values)
+    result.sort_values(by='q_value', inplace=True)
+    result.reset_index(drop=True, inplace=True)
+    return result
+
+
+def build_stats_ranked_bar_plot(
+    results_df, q_col='q_value', direction_col='direction',
+    transition_col='transition', title_suffix='features differing across ages', top_n=20,
+):
+    if results_df.empty:
+        return None
+
+    top = results_df.head(top_n).iloc[::-1]
+    neglog_q = -np.log10(top[q_col].clip(lower=1e-300))
+    colors = ['#dc2626' if d == 'decreases with age' else '#2563eb' for d in top[direction_col]]
+    if transition_col and transition_col in top.columns:
+        labels = [f'{f} ({t})' if t else f for f, t in zip(top['feature'], top[transition_col])]
+    else:
+        labels = list(top['feature'])
+
+    fig, ax = plt.subplots(figsize=(8, max(4, len(top) * 0.35)))
+    ax.barh(labels, neglog_q, color=colors)
+    ax.axvline(-np.log10(0.05), color='black', linestyle='--', linewidth=1)
+    ax.set_xlabel('-log10(q-value)')
+    ax.set_title(f'Top {len(top)} {title_suffix}')
+    ax.legend(handles=[
+        matplotlib.patches.Patch(color='#2563eb', label='increases with age'),
+        matplotlib.patches.Patch(color='#dc2626', label='decreases with age'),
+    ], loc='lower right', fontsize=8)
+    ax.grid(axis='x', alpha=0.3)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}'
+
+
+def build_stats_volcano_plot(
+    results_df, q_col='q_value', effect_col='max_abs_cohens_d', transition_col='transition',
+    xlabel="Effect size (|Cohen's d|)", title='Feature significance vs. effect size (age differences)',
+):
+    if results_df.empty:
+        return None
+
+    x = results_df[effect_col]
+    y = -np.log10(results_df[q_col].clip(lower=1e-300))
+    significant = results_df[q_col] < 0.05
+    has_transition = transition_col and transition_col in results_df.columns
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(x[~significant], y[~significant], color='#9ca3af', s=25, alpha=0.7, label='q ≥ 0.05')
+    ax.scatter(x[significant], y[significant], color='#dc2626', s=30, label='q < 0.05')
+
+    for _, row in results_df[significant].nlargest(10, effect_col).iterrows():
+        transition = row[transition_col] if has_transition else None
+        label = f"{row['feature']} ({transition})" if transition else row['feature']
+        ax.annotate(
+            label, (row[effect_col], -np.log10(max(row[q_col], 1e-300))),
+            fontsize=7, xytext=(4, 2), textcoords='offset points',
+        )
+
+    ax.axhline(-np.log10(0.05), color='black', linestyle='--', linewidth=1)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('-log10(q-value)')
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}'
+
+
+def _transition_start_age(transition):
+    try:
+        return float(str(transition).split(' vs ')[0])
+    except (ValueError, IndexError):
+        return float('inf')
+
+
+def build_pairwise_effect_size_heatmap(results_df, top_n=50):
+    """Rows = features, columns = age transitions, cells = signed Cohen's d — the
+    single view the ranked bar/volcano plots can't give you, since those only surface
+    each feature's single strongest transition. Here every feature-by-transition effect
+    size is visible at once, so you can see whether a feature's change is concentrated
+    in one transition or spread across several, and compare directions across features."""
+    if results_df.empty:
+        return None
+
+    transition_order = sorted(results_df['transition'].dropna().unique(), key=_transition_start_age)
+    if not transition_order:
+        return None
+
+    # Same ranking convention as the ranked bar/volcano plots and results table: most
+    # significant features first (by their best q-value across any transition).
+    feature_rank = results_df.groupby('feature')['q_value'].min().sort_values()
+    top_features = feature_rank.head(top_n).index.tolist()
+
+    pivot = (
+        results_df[results_df['feature'].isin(top_features)]
+        .pivot(index='feature', columns='transition', values='cohens_d')
+        .reindex(index=top_features, columns=transition_order)
+    )
+    if pivot.empty:
+        return None
+
+    values = pivot.values.astype(float)
+    finite = values[np.isfinite(values)]
+    max_abs = float(np.abs(finite).max()) if finite.size else 1.0
+    max_abs = max_abs if max_abs > 0 else 1.0
+
+    fig, ax = plt.subplots(
+        figsize=(max(6, len(transition_order) * 1.7), max(4, len(top_features) * 0.32)),
+    )
+    im = ax.imshow(values, cmap='RdBu_r', vmin=-max_abs, vmax=max_abs, aspect='auto')
+
+    ax.set_xticks(range(len(transition_order)))
+    ax.set_xticklabels(transition_order, rotation=30, ha='right')
+    ax.set_yticks(range(len(top_features)))
+    ax.set_yticklabels(top_features, fontsize=8)
+
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            value = values[i, j]
+            if np.isnan(value):
+                continue
+            ax.text(
+                j, i, f'{value:.2f}', ha='center', va='center', fontsize=7,
+                color='white' if abs(value) > max_abs * 0.6 else 'black',
+            )
+
+    fig.colorbar(im, ax=ax, shrink=0.8, label="Cohen's d  (+ decreases with age, − increases with age)")
+    ax.set_title(f'Age-transition effect-size heatmap (top {len(top_features)} features by q-value)')
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}'
+
+
+def _fmt_stat(value, spec='.3g'):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return 'n/a'
+    if isinstance(value, str):
+        return value
+    return f'{value:{spec}}'
+
+
+def build_overall_stats_table(results_df, max_rows=100):
+    """Kruskal-Wallis, Welch's ANOVA, Spearman's rho, linear regression, and the
+    mixed-effects model — one row per feature."""
+    if results_df.empty:
+        return html.Div('No features could be tested.', className='status-error')
+
+    header = html.Tr([html.Th(h) for h in [
+        'Feature', 'n (groups/total)',
+        'Kruskal-Wallis H', 'KW p', 'KW q',
+        "Welch's ANOVA F", 'Welch p', 'Welch q',
+        'Spearman ρ', 'Spearman p', 'Spearman q',
+        'Linear slope', 'Linear r', 'Linear p', 'Linear q',
+        'Mixed-model coef (age)', 'Mixed p', 'Mixed q', 'Mixed note',
+        'Direction',
+    ]])
+    body_rows = []
+    for _, r in results_df.head(max_rows).iterrows():
+        body_rows.append(html.Tr([
+            html.Td(r['feature']),
+            html.Td(f"{r['n_groups']} / {r['n_total']}"),
+            html.Td(_fmt_stat(r['kw_stat'])), html.Td(_fmt_stat(r['kw_p'], '.2e')), html.Td(_fmt_stat(r['kw_q'], '.2e')),
+            html.Td(_fmt_stat(r['welch_f'])), html.Td(_fmt_stat(r['welch_p'], '.2e')), html.Td(_fmt_stat(r['welch_q'], '.2e')),
+            html.Td(_fmt_stat(r['spearman_rho'])), html.Td(_fmt_stat(r['spearman_p'], '.2e')), html.Td(_fmt_stat(r['spearman_q'], '.2e')),
+            html.Td(_fmt_stat(r['linreg_slope'])), html.Td(_fmt_stat(r['linreg_r'])), html.Td(_fmt_stat(r['linreg_p'], '.2e')), html.Td(_fmt_stat(r['linreg_q'], '.2e')),
+            html.Td(_fmt_stat(r['mixed_coef'])), html.Td(_fmt_stat(r['mixed_p'], '.2e')), html.Td(_fmt_stat(r['mixed_q'], '.2e')), html.Td(_fmt_stat(r['mixed_note'])),
+            html.Td(r['direction']),
+        ]))
+
+    note = None
+    if len(results_df) > max_rows:
+        note = html.P(
+            f"Showing the top {max_rows} of {len(results_df)} tested features (sorted by min(KW q, Welch's ANOVA q)).",
+            className='status-text',
+        )
+    return html.Div([
+        note,
+        table_with_toolbar(
+            html.Table(className='stats-table', children=[html.Thead(header), html.Tbody(body_rows)]),
+            'overall_age_stats',
+        ),
+    ])
+
+
+def build_pairwise_stats_table(results_df, max_rows=100):
+    """Welch's t-test, Mann-Whitney U, Cohen's d, and Cliff's delta — one row per
+    (feature, adjacent age transition)."""
+    if results_df.empty:
+        return html.Div('No features could be tested.', className='status-error')
+
+    header = html.Tr([html.Th(h) for h in [
+        'Feature', 'Transition', 'n (1/2)',
+        "Welch's t p", 'Welch q', 'Mann-Whitney p', 'MW q',
+        "Cohen's d", "Cliff's delta", 'Direction',
+    ]])
+    body_rows = []
+    for _, r in results_df.head(max_rows).iterrows():
+        body_rows.append(html.Tr([
+            html.Td(r['feature']),
+            html.Td(r['transition']),
+            html.Td(f"{r['n1']} / {r['n2']}"),
+            html.Td(_fmt_stat(r['p_value'], '.2e')), html.Td(_fmt_stat(r['q_value'], '.2e')),
+            html.Td(_fmt_stat(r['mannwhitney_p'], '.2e')), html.Td(_fmt_stat(r['mannwhitney_q'], '.2e')),
+            html.Td(_fmt_stat(r['cohens_d'])), html.Td(_fmt_stat(r['cliffs_delta'])),
+            html.Td(r['direction']),
+        ]))
+
+    note = None
+    if len(results_df) > max_rows:
+        note = html.P(
+            f"Showing the top {max_rows} of {len(results_df)} tested rows (sorted by Welch's t-test q-value).",
+            className='status-text',
+        )
+    return html.Div([
+        note,
+        table_with_toolbar(
+            html.Table(className='stats-table', children=[html.Thead(header), html.Tbody(body_rows)]),
+            'pairwise_age_stats',
+        ),
+    ])
 
 
 # --- whole-image prediction overlay -------------------------------------
@@ -1581,6 +2219,10 @@ def main_page_layout(default_base_dir):
                     'Features', id='features-link', href='#', target='_blank',
                     className='btn-primary', style={'background': 'var(--color-text-muted)'},
                 ),
+                html.A(
+                    'Statistics', id='statistics-link', href='#', target='_blank',
+                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
+                ),
             ]),
         ]),
 
@@ -1823,6 +2465,13 @@ def features_page_layout(base_dir, group, task):
             ]),
         ])
 
+    pred_trend_features = list_pred_age_trend_features(base_dir, group, task)
+    tubule_types = list_tubule_types(base_dir, group, task)
+    tubule_type_options = [{'label': 'All tubules', 'value': TUBULE_TYPE_ALL}] + [
+        {'label': t, 'value': t} for t in tubule_types
+    ]
+    default_tubule_type = 'proximal' if 'proximal' in tubule_types else TUBULE_TYPE_ALL
+
     return html.Div(className='app-shell', children=[
         html.A('← Back to explorer', href='/', className='btn-outline'),
         html.Div(className='app-header', children=[
@@ -1909,6 +2558,212 @@ def features_page_layout(base_dir, group, task):
             plot_with_toolbar(
                 html.Img(id='features-box-img', className='umap-card-img umap-card-img-75'),
                 'features_boxplot',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Predicted-age trend', className='card-title'),
+            html.Div(
+                'For tubules with a valid pred_320 in [5, 28): trims outliers (IQR rule) on both pred_320 '
+                'and the feature, bins pred_320 into 0.2-wide buckets and averages within each bucket, then '
+                "plots the trend line and its Spearman correlation. Combines the main tubule table with the "
+                'shape table (joined on contour_id / label_id), so both kinds of feature are selectable here.',
+                className='status-text', style={'marginBottom': '10px'},
+            ),
+            html.Div(className='field-row', children=[
+                html.Div([
+                    html.Label('Feature', className='field-label'),
+                    dcc.Dropdown(
+                        id='pred-trend-feature-dropdown',
+                        options=[{'label': f, 'value': f} for f in pred_trend_features],
+                        value=pred_trend_features[0] if pred_trend_features else None,
+                    ),
+                ]),
+                html.Div([
+                    html.Label('Tubule type', className='field-label'),
+                    dcc.Dropdown(
+                        id='pred-trend-tubule-dropdown',
+                        options=tubule_type_options,
+                        value=default_tubule_type,
+                        clearable=False,
+                    ),
+                ]),
+            ]),
+            html.Button(
+                'Show plot', id='pred-trend-button', n_clicks=0,
+                className='btn-primary', style={'marginTop': '10px'},
+            ),
+            html.Div(id='pred-trend-status', className='status-text', style={'marginTop': '10px'}),
+            plot_with_toolbar(
+                html.Img(id='pred-trend-img', className='umap-card-img umap-card-img-75'), 'pred_age_trend',
+            ),
+        ]),
+    ])
+
+
+def statistics_page_layout(base_dir, group, task):
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
+        return html.Div(className='app-shell', children=[
+            html.A('← Back to explorer', href='/', className='btn-outline'),
+            html.Div(className='app-header', children=[
+                html.H2('Statistics'),
+                html.P('Missing or invalid data folder / group / task. Go back and select them first.'),
+            ]),
+        ])
+
+    available_kinds = list_feature_kinds_available(base_dir, group, task)
+    default_kind = available_kinds[0] if available_kinds else 'main'
+
+    return html.Div(className='app-shell', children=[
+        html.A('← Back to explorer', href='/', className='btn-outline'),
+        html.Div(className='app-header', children=[
+            html.H2('Statistics'),
+            html.P(f'{group} / {task}'),
+        ]),
+
+        dcc.Store(id='stats-context-store', data={
+            'base_dir': base_dir, 'group': group, 'task': task,
+        }),
+        dcc.Store(id='stats-results-store'),
+
+        html.Div(className='card', children=[
+            html.Div('Selection', className='card-title'),
+            html.Div(className='field-row', children=[
+                html.Div([
+                    html.Label('Feature file', className='field-label'),
+                    dcc.Dropdown(
+                        id='stats-kind-dropdown',
+                        options=[{'label': label, 'value': kind} for kind, label in FEATURE_KINDS.items()],
+                        value=default_kind,
+                    ),
+                ]),
+                html.Div([
+                    html.Label('Aggregation level', className='field-label'),
+                    dcc.Dropdown(
+                        id='stats-agg-dropdown',
+                        options=[
+                            {'label': label, 'value': level}
+                            for level, label in FEATURE_AGGREGATION_LEVELS.items()
+                        ],
+                        value='animal_median',
+                        clearable=False,
+                    ),
+                ]),
+            ]),
+            html.Div(
+                f'Runs every test below for every numeric feature: Kruskal-Wallis and Welch\'s ANOVA (does '
+                f'the feature differ across all age groups at once, parametrically and non-parametrically), '
+                f'Spearman\'s ρ and a linear regression (is there a monotonic/linear trend with age), and a '
+                f'random-intercept mixed-effects model (feature ~ age, animal as random effect — uses every '
+                f'tubule while still accounting for which animal it came from). For each pair of adjacent '
+                f'age groups: Welch\'s t-test and Mann-Whitney U (pairwise significance), Cohen\'s d and '
+                f"Cliff's delta (matching effect sizes). Each test's p-values get their own "
+                f'Benjamini-Hochberg FDR q-value across every feature tested. Animal-level aggregation is '
+                f'recommended over raw tubules to avoid pseudoreplication (thousands of correlated tubules '
+                f'from a handful of animals inflating significance)'
+                + ('.' if STATSMODELS_AVAILABLE else ' — statsmodels is not installed, so the mixed-effects '
+                   'model will be skipped.'),
+                className='status-text', style={'marginTop': '10px'},
+            ),
+            html.Button(
+                'Run tests', id='stats-run-button', n_clicks=0,
+                className='btn-primary', style={'marginTop': '10px'},
+            ),
+            html.Div(id='stats-status', className='status-text', style={'marginTop': '10px'}),
+        ]),
+
+        html.Div(className='app-header', children=[
+            html.H3('Differences across all ages'),
+            html.P('Kruskal-Wallis, Welch\'s ANOVA, Spearman\'s ρ, linear regression, mixed-effects model.'),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Ranked features (overall age effect)', className='card-title'),
+            plot_with_toolbar(
+                html.Img(id='stats-overall-ranked-img', className='umap-card-img umap-card-img-75'),
+                'stats_overall_ranked_features',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Effect size vs. significance (volcano plot)', className='card-title'),
+            plot_with_toolbar(
+                html.Img(id='stats-overall-volcano-img', className='umap-card-img umap-card-img-75'),
+                'stats_overall_volcano',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Results table', className='card-title'),
+            html.Div(id='stats-overall-table-container'),
+        ]),
+
+        html.Div(className='app-header', children=[
+            html.H3('Differences between age groups'),
+            html.P("Welch's t-test, Mann-Whitney U, Cohen's d, Cliff's delta — one row per adjacent age transition."),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Age-transition effect-size heatmap', className='card-title'),
+            html.Div(
+                "Rows = features, columns = age transitions, color/value = Cohen's d — see at a glance which "
+                'features move most, in which direction, and whether the change is concentrated in one '
+                'transition or spread across the whole age range.',
+                className='status-text', style={'marginBottom': '10px'},
+            ),
+            plot_with_toolbar(
+                html.Img(id='stats-pairwise-heatmap-img', className='umap-card-img umap-card-img-50'),
+                'stats_pairwise_heatmap',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Ranked features (pairwise age transitions)', className='card-title'),
+            plot_with_toolbar(
+                html.Img(id='stats-pairwise-ranked-img', className='umap-card-img umap-card-img-75'),
+                'stats_pairwise_ranked_features',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Effect size vs. significance (volcano plot)', className='card-title'),
+            plot_with_toolbar(
+                html.Img(id='stats-pairwise-volcano-img', className='umap-card-img umap-card-img-75'),
+                'stats_pairwise_volcano',
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Results table', className='card-title'),
+            html.Div(id='stats-pairwise-table-container'),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Inspect a feature', className='card-title'),
+            html.Div(className='field-row', children=[
+                html.Div([
+                    html.Label('Feature', className='field-label'),
+                    dcc.Dropdown(id='stats-inspect-dropdown'),
+                ]),
+                html.Div([
+                    html.Label('Plot type', className='field-label'),
+                    dcc.Dropdown(
+                        id='stats-inspect-type-dropdown',
+                        options=[
+                            {'label': 'Boxplot', 'value': 'box'},
+                            {'label': 'Violin plot', 'value': 'violin'},
+                        ],
+                        value='box', clearable=False,
+                    ),
+                ]),
+            ]),
+            html.Button(
+                'Show plot', id='stats-inspect-button', n_clicks=0,
+                className='btn-primary', style={'marginTop': '10px'},
+            ),
+            html.Div(id='stats-inspect-status', className='status-text', style={'marginTop': '10px'}),
+            plot_with_toolbar(
+                html.Img(id='stats-inspect-img', className='umap-card-img umap-card-img-75'), 'stats_feature_inspect',
             ),
         ]),
     ])
@@ -2214,6 +3069,8 @@ def register_callbacks(app, default_base_dir):
             return image_viewer_page_layout(base_dir, group, task)
         if pathname == '/features':
             return features_page_layout(base_dir, group, task)
+        if pathname == '/statistics':
+            return statistics_page_layout(base_dir, group, task)
         return main_page_layout(default_base_dir)
 
     @app.callback(
@@ -2264,6 +3121,18 @@ def register_callbacks(app, default_base_dir):
             return '#'
         query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
         return f'/features?{query}'
+
+    @app.callback(
+        Output('statistics-link', 'href'),
+        Input('base-dir-store', 'data'),
+        Input('group-dropdown', 'value'),
+        Input('task-dropdown', 'value'),
+    )
+    def update_statistics_link(base_dir, group, task):
+        if not (base_dir and group and task):
+            return '#'
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
+        return f'/statistics?{query}'
 
     @app.callback(
         Output('features-status', 'children'),
@@ -2444,6 +3313,143 @@ def register_callbacks(app, default_base_dir):
         if img_src is None:
             return html.Span('No rows with values for the selected columns.', className='status-error'), None
         return html.Span(f'{len(df)} row(s) loaded.', className='status-ok'), img_src
+
+    @app.callback(
+        Output('pred-trend-status', 'children'),
+        Output('pred-trend-img', 'src'),
+        Input('pred-trend-button', 'n_clicks'),
+        State('pred-trend-feature-dropdown', 'value'),
+        State('pred-trend-tubule-dropdown', 'value'),
+        State('features-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def show_pred_age_trend(n_clicks, feature, tubule_type, context):
+        if not (n_clicks and feature and context):
+            return dash.no_update, dash.no_update
+
+        try:
+            df = load_main_shape_merged_table(context['base_dir'], context['group'], context['task'])
+            if df.empty:
+                return html.Span('No feature data found.', className='status-error'), None
+            img_src, rho, p_value = build_pred_age_trend_plot(df, feature, tubule_type=tubule_type or TUBULE_TYPE_ALL)
+        except Exception:
+            return html.Pre(traceback.format_exc(), className='metrics-box'), None
+
+        if img_src is None:
+            tubule_note = 'any tubule type' if not tubule_type or tubule_type == TUBULE_TYPE_ALL else f'{tubule_type} tubules'
+            return html.Span(
+                f'Not enough data for this feature after filtering ({tubule_note}, pred_320 in '
+                '[5, 28), outliers trimmed).', className='status-error',
+            ), None
+
+        sig_note = 'significant' if p_value <= 0.05 else 'not significant'
+        status_class = 'status-ok' if p_value <= 0.05 else 'status-text'
+        return html.Span(
+            f'Spearman R={rho:.3f}, p={p_value:.3g} ({sig_note} at α = 0.05).', className=status_class,
+        ), img_src
+
+    @app.callback(
+        Output('stats-status', 'children'),
+        Output('stats-overall-ranked-img', 'src'),
+        Output('stats-overall-volcano-img', 'src'),
+        Output('stats-overall-table-container', 'children'),
+        Output('stats-pairwise-heatmap-img', 'src'),
+        Output('stats-pairwise-ranked-img', 'src'),
+        Output('stats-pairwise-volcano-img', 'src'),
+        Output('stats-pairwise-table-container', 'children'),
+        Output('stats-inspect-dropdown', 'options'),
+        Output('stats-inspect-dropdown', 'value'),
+        Output('stats-results-store', 'data'),
+        Input('stats-run-button', 'n_clicks'),
+        State('stats-kind-dropdown', 'value'),
+        State('stats-agg-dropdown', 'value'),
+        State('stats-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def run_feature_stats(n_clicks, kind, level, context):
+        no_updates = (dash.no_update,) * 10
+        if not (n_clicks and context and kind):
+            return (dash.no_update, *no_updates)
+
+        try:
+            df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            df = aggregate_feature_table(df, level or 'animal_median')
+            if df.empty or 'class_name' not in df.columns:
+                status = html.Span(
+                    'No feature data (or no class_name/age column) found for this selection.',
+                    className='status-error',
+                )
+                return (status, *no_updates)
+            overall = compute_overall_feature_stats(df, age_col='class_name')
+            pairwise = compute_pairwise_feature_stats(df, age_col='class_name')
+        except Exception:
+            return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
+
+        if overall.empty and pairwise.empty:
+            status = html.Span(
+                'No numeric features could be tested (need at least 2 age groups with data).',
+                className='status-error',
+            )
+            return (status, *no_updates)
+
+        overall_ranked_src = build_stats_ranked_bar_plot(
+            overall, title_suffix='features by overall age effect',
+        )
+        overall_volcano_src = build_stats_volcano_plot(
+            overall, effect_col='abs_spearman_rho', transition_col=None,
+            xlabel="Effect size (|Spearman ρ|)", title='Overall age effect: significance vs. trend strength',
+        )
+        overall_table = build_overall_stats_table(overall)
+
+        pairwise_heatmap_src = build_pairwise_effect_size_heatmap(pairwise)
+        pairwise_ranked_src = build_stats_ranked_bar_plot(
+            pairwise, title_suffix='features by pairwise age-transition difference',
+        )
+        pairwise_volcano_src = build_stats_volcano_plot(pairwise)
+        pairwise_table = build_pairwise_stats_table(pairwise)
+
+        unique_features = list(dict.fromkeys([*overall['feature'], *pairwise['feature']]))
+        feature_options = [{'label': f, 'value': f} for f in unique_features]
+        n_sig_overall = int((overall['q_value'] < 0.05).sum()) if not overall.empty else 0
+        n_sig_pairwise = int((pairwise['q_value'] < 0.05).sum()) if not pairwise.empty else 0
+        status = html.Span(
+            f'{len(overall)} feature(s) tested overall ({n_sig_overall} significant at q < 0.05) · '
+            f'{len(pairwise)} feature-transition row(s) tested pairwise ({n_sig_pairwise} significant).',
+            className='status-ok',
+        )
+
+        return (
+            status,
+            overall_ranked_src, overall_volcano_src, overall_table,
+            pairwise_heatmap_src, pairwise_ranked_src, pairwise_volcano_src, pairwise_table,
+            feature_options, unique_features[0] if unique_features else None,
+            {'kind': kind, 'level': level or 'animal_median'},
+        )
+
+    @app.callback(
+        Output('stats-inspect-status', 'children'),
+        Output('stats-inspect-img', 'src'),
+        Input('stats-inspect-button', 'n_clicks'),
+        State('stats-inspect-dropdown', 'value'),
+        State('stats-inspect-type-dropdown', 'value'),
+        State('stats-results-store', 'data'),
+        State('stats-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def show_stats_inspect_plot(n_clicks, feature, plot_type, results_meta, context):
+        if not (n_clicks and feature and results_meta and context):
+            return dash.no_update, dash.no_update
+
+        try:
+            df = load_feature_table(context['base_dir'], context['group'], context['task'], results_meta['kind'])
+            df = aggregate_feature_table(df, results_meta.get('level', 'animal_median'))
+            img_src = build_feature_box_or_violin_plot(df, 'class_name', feature, None, plot_type or 'box')
+        except Exception:
+            return html.Pre(traceback.format_exc(), className='metrics-box'), None
+
+        if img_src is None:
+            return html.Span('No rows with values for this feature.', className='status-error'), None
+        return html.Span(f'Showing {feature} by class_name.', className='status-ok'), img_src
 
     TILE_HEATMAP_IDLE_STATUS = (
         'Turn on "Inspect tile" above and click a point on the overlay image to load '

@@ -67,7 +67,33 @@ for the whole-image overlay, `data/`:
   point to crop and view its protein/lipid region from the source whole-slide image, only
   available at the tubule level) or a seaborn boxplot/violin plot (with pairwise Welch's
   t-test + Cohen's d between adjacent x categories) from any of its columns, with an
-  optional hue column, across every image's feature file in the task.
+  optional hue column, across every image's feature file in the task. Also has a
+  "Predicted-age trend" plot: pick any numeric column from the combined main + shape
+  tables (identifiers, coordinates, and the model's own prediction/attention outputs are
+  excluded) and a tubule type (all tubules, or one specific type), and see the feature's
+  trend against the model's own continuous `pred_320` prediction — outlier-trimmed (IQR)
+  on both axes, binned into 0.2-wide `pred_320` buckets and averaged, then plotted with a
+  regression line and its Spearman correlation (shown for any p-value, not just
+  significant ones).
+- **Statistics** — pick a feature file and aggregation level, then screen every numeric
+  feature with the full test suite at once, each ranked by its own Benjamini-Hochberg
+  FDR-corrected q-value:
+  - *Differences across all ages* (one row per feature): Kruskal-Wallis, Welch's ANOVA
+    (parametric, robust to unequal variance), Spearman's ρ and a linear regression (is
+    there a monotonic/linear trend with age), and a random-intercept mixed-effects model
+    (`feature ~ age`, animal as random effect — uses every tubule while accounting for
+    which animal it came from; requires `statsmodels`, degrades gracefully if missing).
+  - *Differences between age groups* (one row per feature × adjacent age transition):
+    Welch's t-test + Mann-Whitney U as a parametric/non-parametric pairwise pair, and
+    Cohen's d + Cliff's delta as their matching effect sizes — the same comparison the
+    Features-page boxplot annotates, run exhaustively for every feature and transition.
+    This section also has an age-transition effect-size heatmap (rows = features,
+    columns = transitions, color/value = Cohen's d) showing every feature-by-transition
+    effect at once, not just each feature's single strongest transition.
+  Each section gets its own ranked bar chart, volcano plot (effect size vs.
+  significance), and results table — each table has its own copy (tab-separated, pastes
+  into a spreadsheet) and download (.csv) buttons; pick any tested feature to drill into
+  its boxplot/violin plot by age.
 
 ## License
 
