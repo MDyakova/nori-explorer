@@ -131,6 +131,92 @@ def compute_metrics(base_dir, umap_df, group, task):
     return mae, r2, max_p, max_l
 
 
+# --- features data helpers -----------------------------------------------
+
+# Each image_name in outputs/<group>/<task>/features/ has up to three CSVs: the
+# tubule-level table itself (<image_name>.csv), and two suffixed side tables.
+FEATURE_KINDS = {
+    'main': 'Tubule features (<image_name>.csv)',
+    'nucleolus': 'Nucleolus features (<image_name>_nucleolus.csv)',
+    'shape': 'Shape features (<image_name>_shape.csv)',
+}
+_FEATURE_SUFFIXES = {'main': '.csv', 'nucleolus': '_nucleolus.csv', 'shape': '_shape.csv'}
+
+
+def features_dir_path(base_dir, group, task):
+    return os.path.join(base_dir, 'outputs', group, task, 'features')
+
+
+def list_feature_files(base_dir, group, task, kind):
+    """[(image_name, path), ...] for feature files of `kind` ('main'/'nucleolus'/'shape')."""
+    feat_dir = features_dir_path(base_dir, group, task)
+    if not os.path.isdir(feat_dir):
+        return []
+
+    suffix = _FEATURE_SUFFIXES[kind]
+    other_suffixes = [s for k, s in _FEATURE_SUFFIXES.items() if k != kind and s != '.csv']
+
+    items = []
+    for fname in sorted(os.listdir(feat_dir)):
+        if not fname.endswith('.csv'):
+            continue
+        if kind == 'main':
+            if any(fname.endswith(s) for s in other_suffixes):
+                continue
+            image_name = fname[:-len('.csv')]
+        else:
+            if not fname.endswith(suffix):
+                continue
+            image_name = fname[:-len(suffix)]
+        items.append((image_name, os.path.join(feat_dir, fname)))
+    return items
+
+
+def list_feature_kinds_available(base_dir, group, task):
+    return [kind for kind in FEATURE_KINDS if list_feature_files(base_dir, group, task, kind)]
+
+
+def get_feature_columns(base_dir, group, task, kind):
+    """Column names for `kind`, read from just the first file (schema is shared)."""
+    files = list_feature_files(base_dir, group, task, kind)
+    if not files:
+        return []
+    try:
+        columns = list(pd.read_csv(files[0][1], nrows=0).columns)
+    except Exception:
+        return []
+    if 'file_name_save' in columns and 'sample_name' not in columns:
+        columns.append('sample_name')
+    return columns
+
+
+def load_feature_table(base_dir, group, task, kind):
+    """Concatenate every image's feature file of `kind` into one dataframe, adding a
+    `sample_name` (animal) column derived the same way the umap CSVs' sample_name is."""
+    frames = []
+    for image_name, path in list_feature_files(base_dir, group, task, kind):
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if 'file_name_save' not in df.columns:
+            df['file_name_save'] = image_name
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined['sample_name'] = combined['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
+
+    if 'class_name' in combined.columns:
+        combined['class_name'] = combined['class_name'].astype(int)
+        combined.sort_values(by=['class_name'], inplace=True)
+        combined['class_name'] = combined['class_name'].astype(str)
+
+    return combined
+
+
 # --- image helpers ------------------------------------------------------
 
 def pil_to_data_uri(img):
@@ -509,6 +595,179 @@ def build_animal_median_age_trend_plot(base_dir, group, task, model_names):
     ax.set_title('Median predicted age by animal (dots colored by model)')
     ax.grid(alpha=0.3)
     ax.legend(title='Model', bbox_to_anchor=(1.02, 0.5), loc='center left', fontsize=8, title_fontsize=8)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/png;base64,{encoded}'
+
+
+# --- features plots -------------------------------------------------------
+
+def round_if_float(value, ndigits=2):
+    return np.round(value, ndigits) if isinstance(value, float) else value
+
+
+def filter_feature_rows(df, cols):
+    """Drop rows with missing values or the -1 sentinel (used across the feature CSVs
+    for "not computed") in any of `cols`."""
+    cols = [c for c in cols if c]
+    if not cols:
+        return df
+
+    mask = pd.Series(True, index=df.index)
+    for col in cols:
+        mask &= df[col].notna()
+        if pd.api.types.is_numeric_dtype(df[col]):
+            mask &= df[col] != -1
+    return df[mask]
+
+
+FEATURE_ROW_ID_COLS = ('contour_id', 'label_id')
+FEATURE_BBOX_COLS = ('min_x', 'min_y', 'max_x', 'max_y')
+
+
+def build_feature_scatter_figure(df, x_col, y_col, hue_col=None):
+    """Interactive scatter (like the UMAP embedding plot) — each point's customdata
+    carries its image name plus either its own bounding box (the main tubule table) or
+    its row id (nucleolus/shape tables, resolved against the main table on click), so a
+    click can look up and crop the source protein/lipid image."""
+    id_col = next((c for c in FEATURE_ROW_ID_COLS if c in df.columns), None)
+    has_bbox = all(c in df.columns for c in FEATURE_BBOX_COLS)
+
+    extra_cols = list(FEATURE_BBOX_COLS) if has_bbox else ([id_col] if id_col else [])
+    plot_df = filter_feature_rows(df, [x_col, y_col, hue_col, *extra_cols])
+    if plot_df.empty:
+        return None
+
+    def customdata_for(sub_df):
+        n = len(sub_df)
+        return np.column_stack([
+            sub_df['file_name_save'] if 'file_name_save' in sub_df.columns else [''] * n,
+            sub_df[id_col] if id_col else [np.nan] * n,
+            sub_df['min_x'] if has_bbox else [np.nan] * n,
+            sub_df['min_y'] if has_bbox else [np.nan] * n,
+            sub_df['max_x'] if has_bbox else [np.nan] * n,
+            sub_df['max_y'] if has_bbox else [np.nan] * n,
+        ])
+
+    hover = (
+        f'{x_col}: %{{x}}<br>{y_col}: %{{y}}<br>Image: %{{customdata[0]}}<extra></extra>'
+    )
+
+    fig = go.Figure()
+    if hue_col:
+        for hue_value, sub_df in plot_df.groupby(hue_col):
+            fig.add_trace(go.Scatter(
+                x=sub_df[x_col], y=sub_df[y_col], mode='markers', name=str(hue_value),
+                marker=dict(size=7), customdata=customdata_for(sub_df),
+                hovertemplate=f'{hue_col}: {hue_value}<br>{hover}',
+            ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=plot_df[x_col], y=plot_df[y_col], mode='markers',
+            marker=dict(size=7, color='#3b82f6'), customdata=customdata_for(plot_df),
+            hovertemplate=hover,
+        ))
+
+    fig.update_layout(
+        template='plotly_white',
+        title=f'{y_col} vs {x_col}' + (f' by {hue_col}' if hue_col else ''),
+        xaxis_title=x_col,
+        yaxis_title=y_col,
+        font=dict(family='-apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif', size=12),
+        margin=dict(l=50, r=30, t=50, b=50),
+        height=560,
+        legend_title_text=hue_col or None,
+    )
+    return fig
+
+
+def get_feature_bbox_lookup(base_dir, group, task):
+    """(file_name_save, contour_id) -> (min_x, min_y, max_x, max_y), from the main
+    tubule-level feature table. The nucleolus/shape tables don't carry bbox columns
+    themselves but share this id (as `label_id`) with the main table's `contour_id`."""
+    main_df = load_feature_table(base_dir, group, task, 'main')
+    if main_df.empty:
+        return {}
+    required = {'file_name_save', 'contour_id', *FEATURE_BBOX_COLS}
+    if not required.issubset(main_df.columns):
+        return {}
+
+    lookup = {}
+    for row in main_df[list(required)].dropna().itertuples(index=False):
+        lookup[(row.file_name_save, row.contour_id)] = (row.min_x, row.min_y, row.max_x, row.max_y)
+    return lookup
+
+
+def build_feature_tile_crop_image(base_dir, group, task, image_name, min_x, min_y, max_x, max_y, min_display_px=220):
+    """Crop the whole-slide .tif for `image_name` to [min_y:max_y, min_x:max_x] and
+    render it as a protein/lipid composite, upscaled if the crop is very small."""
+    _, tif_path = resolve_whole_image_path(base_dir, group, image_name)
+    if tif_path is None:
+        raise FileNotFoundError(f'Whole-slide image not found for {image_name}')
+
+    with TiffFile(tif_path) as tif:
+        image = tif.asarray()
+
+    h, w = image.shape[1], image.shape[2]
+    min_x, min_y, max_x, max_y = (int(round(v)) for v in (min_x, min_y, max_x, max_y))
+    min_x, max_x = max(0, min_x), min(w, max_x)
+    min_y, max_y = max(0, min_y), min(h, max_y)
+    if max_x <= min_x or max_y <= min_y:
+        raise ValueError('Empty crop region.')
+
+    crop = image[:, min_y:max_y, min_x:max_x]
+
+    channel_names = load_channel_names(base_dir, group, task)
+    max_p, max_l = load_max_values(base_dir, group, task)
+    channel_indices = sorted({
+        find_channel_index(channel_names, 'protein', 0),
+        find_channel_index(channel_names, 'lipid', 1),
+    })
+
+    def channel_norm_max(idx):
+        name = channel_names.get(idx, '').lower()
+        return channel_norm_max_value(crop, idx, name, NORM_MODE_GLOBAL, max_p, max_l)
+
+    composite = compose_channels(crop, channel_indices, channel_names, channel_norm_max)
+    pil_img = Image.fromarray((composite * 255).astype(np.uint8))
+
+    if max(pil_img.width, pil_img.height) < min_display_px:
+        scale = min_display_px / max(pil_img.width, pil_img.height, 1)
+        pil_img = pil_img.resize(
+            (max(1, round(pil_img.width * scale)), max(1, round(pil_img.height * scale))),
+            resample=Image.LANCZOS,
+        )
+
+    return pil_img, tif_path, (min_x, min_y, max_x, max_y)
+
+
+def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='box'):
+    plot_df = filter_feature_rows(df, [x_col, y_col, hue_col])
+    if plot_df.empty:
+        return None
+
+    n_categories = max(plot_df[x_col].nunique(), 1)
+    fig, ax = plt.subplots(figsize=(max(7, n_categories * 0.6), 6))
+    if plot_type == 'violin':
+        sns.violinplot(data=plot_df, x=x_col, y=y_col, hue=hue_col, cut=0, ax=ax)
+    else:
+        sns.boxplot(data=plot_df, x=x_col, y=y_col, hue=hue_col, showfliers=False, ax=ax)
+
+    ax.set_xlabel(x_col)
+    ax.set_ylabel(y_col)
+    plot_label = 'Violin plot' if plot_type == 'violin' else 'Boxplot'
+    title = f'{plot_label}: {y_col} by {x_col}'
+    ax.set_title(f'{title}, hue={hue_col}' if hue_col else title)
+    ax.tick_params(axis='x', rotation=45)
+    for label in ax.get_xticklabels():
+        label.set_ha('right')
+    ax.grid(True, axis='y', alpha=0.3)
+    if hue_col:
+        ax.legend(title=hue_col, bbox_to_anchor=(1.02, 0.5), loc='center left', fontsize=8, title_fontsize=8)
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -1187,6 +1446,10 @@ def main_page_layout(default_base_dir):
                     'Image viewer', id='image-viewer-link', href='#', target='_blank',
                     className='btn-primary', style={'background': 'var(--color-text-muted)'},
                 ),
+                html.A(
+                    'Features', id='features-link', href='#', target='_blank',
+                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
+                ),
             ]),
         ]),
 
@@ -1387,6 +1650,124 @@ def all_umaps_page_layout(base_dir, group, task):
         *combined_section,
         *nav_section,
         html.Div(cards),
+    ])
+
+
+def features_page_layout(base_dir, group, task):
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
+        return html.Div(className='app-shell', children=[
+            html.A('← Back to explorer', href='/', className='btn-outline'),
+            html.Div(className='app-header', children=[
+                html.H2('Features'),
+                html.P('Missing or invalid data folder / group / task. Go back and select them first.'),
+            ]),
+        ])
+
+    feat_dir = features_dir_path(base_dir, group, task)
+    available_kinds = list_feature_kinds_available(base_dir, group, task)
+    default_kind = available_kinds[0] if available_kinds else 'main'
+
+    try:
+        columns = get_feature_columns(base_dir, group, task, default_kind)
+    except Exception:
+        columns = []
+    column_options = [{'label': c, 'value': c} for c in columns]
+    hue_options = [{'label': '(none)', 'value': ''}] + column_options
+    default_x = columns[0] if columns else None
+    default_y = columns[1] if len(columns) > 1 else default_x
+
+    def column_picker_row(prefix):
+        return html.Div(className='field-row', children=[
+            html.Div([
+                html.Label('X', className='field-label'),
+                dcc.Dropdown(id=f'{prefix}-x-dropdown', options=column_options, value=default_x),
+            ]),
+            html.Div([
+                html.Label('Y', className='field-label'),
+                dcc.Dropdown(id=f'{prefix}-y-dropdown', options=column_options, value=default_y),
+            ]),
+            html.Div([
+                html.Label('Hue', className='field-label'),
+                dcc.Dropdown(id=f'{prefix}-hue-dropdown', options=hue_options, value=''),
+            ]),
+        ])
+
+    return html.Div(className='app-shell', children=[
+        html.A('← Back to explorer', href='/', className='btn-outline'),
+        html.Div(className='app-header', children=[
+            html.H2('Features'),
+            html.P(f'{group} / {task}'),
+        ]),
+
+        dcc.Store(id='features-context-store', data={
+            'base_dir': base_dir, 'group': group, 'task': task,
+        }),
+
+        html.Div(className='card', children=[
+            html.Div('Selection', className='card-title'),
+            html.Div(f'Looking for feature files in: {feat_dir}', className='status-text'),
+            html.Div(className='field-row', style={'marginTop': '14px'}, children=[
+                html.Div([
+                    html.Label('Feature file', className='field-label'),
+                    dcc.Dropdown(
+                        id='features-kind-dropdown',
+                        options=[{'label': label, 'value': kind} for kind, label in FEATURE_KINDS.items()],
+                        value=default_kind,
+                    ),
+                ]),
+            ]),
+            html.Div(id='features-status', className='status-text', style={'marginTop': '10px'}),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Scatter plot', className='card-title'),
+            column_picker_row('scatter'),
+            html.Button(
+                'Plot scatter', id='features-scatter-button', n_clicks=0,
+                className='btn-primary', style={'marginTop': '10px'},
+            ),
+            html.Div(id='features-scatter-status', className='status-text', style={'marginTop': '10px'}),
+            dcc.Graph(id='features-scatter-graph'),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Selected point — protein / lipid crop', className='card-title'),
+            html.Div(
+                id='features-tile-panel',
+                children=html.Div(
+                    'Click a point in the scatter plot to inspect its protein/lipid crop.',
+                    className='tile-placeholder',
+                ),
+            ),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Boxplot / violin plot', className='card-title'),
+            html.Div(className='field-row', children=[
+                html.Div([
+                    html.Label('Plot type', className='field-label'),
+                    dcc.Dropdown(
+                        id='box-plot-type-dropdown',
+                        options=[
+                            {'label': 'Boxplot', 'value': 'box'},
+                            {'label': 'Violin plot', 'value': 'violin'},
+                        ],
+                        value='box',
+                        clearable=False,
+                    ),
+                ]),
+            ]),
+            column_picker_row('box'),
+            html.Button(
+                'Plot', id='features-box-button', n_clicks=0,
+                className='btn-primary', style={'marginTop': '10px'},
+            ),
+            html.Div(id='features-box-status', className='status-text', style={'marginTop': '10px'}),
+            plot_with_toolbar(
+                html.Img(id='features-box-img', className='umap-card-img umap-card-img-75'),
+                'features_boxplot',
+            ),
+        ]),
     ])
 
 
@@ -1688,6 +2069,8 @@ def register_callbacks(app, default_base_dir):
             return whole_image_overlay_page_layout(base_dir, group, task, model)
         if pathname == '/image-viewer':
             return image_viewer_page_layout(base_dir, group, task)
+        if pathname == '/features':
+            return features_page_layout(base_dir, group, task)
         return main_page_layout(default_base_dir)
 
     @app.callback(
@@ -1726,6 +2109,191 @@ def register_callbacks(app, default_base_dir):
             return '#'
         query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
         return f'/image-viewer?{query}'
+
+    @app.callback(
+        Output('features-link', 'href'),
+        Input('base-dir-store', 'data'),
+        Input('group-dropdown', 'value'),
+        Input('task-dropdown', 'value'),
+    )
+    def update_features_link(base_dir, group, task):
+        if not (base_dir and group and task):
+            return '#'
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
+        return f'/features?{query}'
+
+    @app.callback(
+        Output('features-status', 'children'),
+        Output('scatter-x-dropdown', 'options'),
+        Output('scatter-y-dropdown', 'options'),
+        Output('scatter-hue-dropdown', 'options'),
+        Output('box-x-dropdown', 'options'),
+        Output('box-y-dropdown', 'options'),
+        Output('box-hue-dropdown', 'options'),
+        Output('scatter-x-dropdown', 'value'),
+        Output('scatter-y-dropdown', 'value'),
+        Output('scatter-hue-dropdown', 'value'),
+        Output('box-x-dropdown', 'value'),
+        Output('box-y-dropdown', 'value'),
+        Output('box-hue-dropdown', 'value'),
+        Input('features-kind-dropdown', 'value'),
+        State('features-context-store', 'data'),
+    )
+    def update_feature_columns(kind, context):
+        no_updates = (dash.no_update,) * 12
+        if not (kind and context):
+            return (html.Span('Select a feature file.', className='status-text'), *no_updates)
+
+        try:
+            columns = get_feature_columns(context['base_dir'], context['group'], context['task'], kind)
+            n_files = len(list_feature_files(context['base_dir'], context['group'], context['task'], kind))
+        except Exception:
+            return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
+
+        if not columns:
+            empty_hue = [{'label': '(none)', 'value': ''}]
+            status = html.Span(
+                f'No feature files found for this selection in {features_dir_path(context["base_dir"], context["group"], context["task"])}',
+                className='status-error',
+            )
+            return (
+                status, [], [], empty_hue, [], [], empty_hue,
+                None, None, '', None, None, '',
+            )
+
+        column_options = [{'label': c, 'value': c} for c in columns]
+        hue_options = [{'label': '(none)', 'value': ''}] + column_options
+        default_x = columns[0]
+        default_y = columns[1] if len(columns) > 1 else columns[0]
+        status = html.Span(f'{len(columns)} column(s) across {n_files} image(s).', className='status-ok')
+
+        return (
+            status,
+            column_options, column_options, hue_options,
+            column_options, column_options, hue_options,
+            default_x, default_y, '',
+            default_x, default_y, '',
+        )
+
+    @app.callback(
+        Output('features-scatter-status', 'children'),
+        Output('features-scatter-graph', 'figure'),
+        Input('features-scatter-button', 'n_clicks'),
+        State('features-kind-dropdown', 'value'),
+        State('scatter-x-dropdown', 'value'),
+        State('scatter-y-dropdown', 'value'),
+        State('scatter-hue-dropdown', 'value'),
+        State('features-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_features_scatter(n_clicks, kind, x_col, y_col, hue_col, context):
+        if not (n_clicks and context and kind and x_col and y_col):
+            return dash.no_update, dash.no_update
+
+        try:
+            df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            if df.empty:
+                return html.Span('No feature data found.', className='status-error'), go.Figure()
+            fig = build_feature_scatter_figure(df, x_col, y_col, hue_col or None)
+        except Exception:
+            return html.Pre(traceback.format_exc(), className='metrics-box'), go.Figure()
+
+        if fig is None:
+            return html.Span('No rows with values for the selected columns.', className='status-error'), go.Figure()
+        return html.Span(f'{len(df)} row(s) loaded.', className='status-ok'), fig
+
+    @app.callback(
+        Output('features-tile-panel', 'children'),
+        Input('features-scatter-graph', 'clickData'),
+        State('features-kind-dropdown', 'value'),
+        State('scatter-x-dropdown', 'value'),
+        State('scatter-y-dropdown', 'value'),
+        State('features-context-store', 'data'),
+    )
+    def display_feature_tile(click_data, kind, x_col, y_col, context):
+        placeholder = html.Div(
+            'Click a point in the scatter plot to inspect its protein/lipid crop.',
+            className='tile-placeholder',
+        )
+        if not click_data or not context:
+            return placeholder
+
+        point = click_data['points'][0]
+        image_name, id_value, min_x, min_y, max_x, max_y = point['customdata']
+        dot_x, dot_y = round_if_float(point['x']), round_if_float(point['y'])
+
+        dot_coords_line = html.P([
+            html.Strong('Image: '), image_name, '   ',
+            html.Strong(f'{x_col}: '), f'{dot_x}   ',
+            html.Strong(f'{y_col}: '), f'{dot_y}',
+        ], className='tile-meta')
+
+        bbox_missing = any(v is None or (isinstance(v, float) and np.isnan(v)) for v in (min_x, min_y, max_x, max_y))
+        if bbox_missing:
+            if id_value is None or (isinstance(id_value, float) and np.isnan(id_value)):
+                return html.Div([
+                    dot_coords_line,
+                    html.Div('No bounding-box coordinates available for this point.', className='status-error'),
+                ])
+            try:
+                lookup = get_feature_bbox_lookup(context['base_dir'], context['group'], context['task'])
+            except Exception:
+                return html.Div([dot_coords_line, html.Pre(traceback.format_exc(), className='metrics-box')])
+
+            bbox = lookup.get((image_name, id_value))
+            if bbox is None:
+                return html.Div([
+                    dot_coords_line,
+                    html.Div('No bounding-box coordinates available for this point.', className='status-error'),
+                ])
+            min_x, min_y, max_x, max_y = bbox
+
+        try:
+            crop_img, tif_path, (min_x, min_y, max_x, max_y) = build_feature_tile_crop_image(
+                context['base_dir'], context['group'], context['task'], image_name, min_x, min_y, max_x, max_y,
+            )
+        except Exception:
+            return html.Div([dot_coords_line, html.Pre(traceback.format_exc(), className='metrics-box')])
+
+        return html.Div([
+            dot_coords_line,
+            html.P([
+                html.Strong('Region: '), f'y[{min_y}:{max_y}], x[{min_x}:{max_x}]',
+            ], className='tile-meta'),
+            html.P(f'Source: {tif_path}', className='tile-meta'),
+            plot_with_toolbar(
+                html.Img(src=pil_to_data_uri(crop_img), className='tile-image'),
+                f'{image_name}_crop_y{min_y}-{max_y}_x{min_x}-{max_x}',
+            ),
+        ])
+
+    @app.callback(
+        Output('features-box-status', 'children'),
+        Output('features-box-img', 'src'),
+        Input('features-box-button', 'n_clicks'),
+        State('features-kind-dropdown', 'value'),
+        State('box-plot-type-dropdown', 'value'),
+        State('box-x-dropdown', 'value'),
+        State('box-y-dropdown', 'value'),
+        State('box-hue-dropdown', 'value'),
+        State('features-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_features_box(n_clicks, kind, plot_type, x_col, y_col, hue_col, context):
+        if not (n_clicks and context and kind and x_col and y_col):
+            return dash.no_update, dash.no_update
+
+        try:
+            df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            if df.empty:
+                return html.Span('No feature data found.', className='status-error'), None
+            img_src = build_feature_box_or_violin_plot(df, x_col, y_col, hue_col or None, plot_type or 'box')
+        except Exception:
+            return html.Pre(traceback.format_exc(), className='metrics-box'), None
+
+        if img_src is None:
+            return html.Span('No rows with values for the selected columns.', className='status-error'), None
+        return html.Span(f'{len(df)} row(s) loaded.', className='status-ok'), img_src
 
     TILE_HEATMAP_IDLE_STATUS = (
         'Turn on "Inspect tile" above and click a point on the overlay image to load '

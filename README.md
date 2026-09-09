@@ -38,10 +38,14 @@ for the whole-image overlay, `data/`:
 │           ├── max_values.csv               # columns: protein, lipid
 │           ├── heatmaps/
 │           │   └── <model_name>/<age>/<filename>   # per-tile heatmap images
-│           └── models/                       # optional training-curve images, named
-│               ├── epoch_loss_<model_name>.*        # e.g. loss_<model>.png
-│               ├── mae_<model_name>.*
-│               └── r2_<model_name>.*
+│           ├── models/                       # optional training-curve images, named
+│           │   ├── epoch_loss_<model_name>.*        # e.g. loss_<model>.png
+│           │   ├── mae_<model_name>.*
+│           │   └── r2_<model_name>.*
+│           └── features/                     # optional, for the "Features" page
+│               ├── <image_name>.csv                 # tubule-level features
+│               ├── <image_name>_nucleolus.csv        # per-nucleolus features
+│               └── <image_name>_shape.csv            # per-tubule shape features
 └── data/
     └── <group>/
         └── <class_name>/
@@ -57,6 +61,11 @@ for the whole-image overlay, `data/`:
   curves) for every model in a task, with a combined prediction-by-sample boxplot.
 - **Whole-image overlay** — renders a selected whole-slide `.tif` with per-tile
   predictions overlaid as a heatmap.
+- **Features** — pick one of the three feature-file kinds (tubule, nucleolus, shape),
+  then build an interactive scatter plot (like the UMAP embedding — click a point to crop
+  and view its protein/lipid region from the source whole-slide image) or a seaborn
+  boxplot/violin plot from any of its columns, with an optional hue column, across every
+  image's feature file in the task.
 
 ## License
 
