@@ -4274,5 +4274,15 @@ def start(host='127.0.0.1', port=8050, debug=False, open_browser=True, base_dir=
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-dir', default=None, help='Folder containing outputs/ and data/ (default: cwd)')
+    parser.add_argument(
+        '--host', default='127.0.0.1',
+        help='Interface to bind to. Use 0.0.0.0 to allow other machines on the network to '
+             'connect (default: 127.0.0.1, local machine only).',
+    )
+    parser.add_argument('--port', type=int, default=8050)
+    parser.add_argument(
+        '--no-browser', action='store_true',
+        help='Do not auto-open a browser on start (useful on a headless/remote machine).',
+    )
     args = parser.parse_args()
-    start(base_dir=args.base_dir)
+    start(host=args.host, port=args.port, open_browser=not args.no_browser, base_dir=args.base_dir)
