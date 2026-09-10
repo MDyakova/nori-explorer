@@ -1,3 +1,6 @@
+# Windows "mark of the web" artifacts (appear when files are copied from Windows into WSL)
+*Zone.Identifier*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

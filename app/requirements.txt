@@ -1,0 +1,11 @@
+dash
+plotly
+pandas
+numpy
+Pillow
+scipy
+scikit-learn
+statsmodels
+matplotlib
+seaborn
+tifffile
