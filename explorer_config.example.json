@@ -1,0 +1,6 @@
+{
+  "hidden_groups": ["group_a"],
+  "hidden_tasks": {
+    "group_b": ["task_wip", "task_old"]
+  }
+}
