@@ -815,6 +815,7 @@ def build_feature_scatter_figure(df, x_col, y_col, hue_col=None):
             sub_df['min_y'] if has_bbox else [np.nan] * n,
             sub_df['max_x'] if has_bbox else [np.nan] * n,
             sub_df['max_y'] if has_bbox else [np.nan] * n,
+            sub_df['step'] if 'step' in sub_df.columns else [np.nan] * n,
         ])
 
     hover = (
@@ -850,20 +851,29 @@ def build_feature_scatter_figure(df, x_col, y_col, hue_col=None):
 
 
 def get_feature_bbox_lookup(base_dir, group, task):
-    """(file_name_save, contour_id) -> (min_x, min_y, max_x, max_y), from the main
-    tubule-level feature table. The nuclei/shape tables don't carry bbox columns
+    """Two bbox lookups built from the main (tubule_features) table, both mapping to
+    (min_x, min_y, max_x, max_y): `by_step` keyed by (file_name_save, contour_id, step)
+    — the precise match, since contour_id numbering restarts within each step/tile —
+    and `by_id` keyed by just (file_name_save, contour_id) as a looser fallback for
+    when a step value isn't available. The nuclei/shape tables don't carry bbox columns
     themselves but share this id (as `label_id`) with the main table's `contour_id`."""
     main_df = load_feature_table(base_dir, group, task, 'main')
     if main_df.empty:
-        return {}
+        return {}, {}
     required = {'file_name_save', 'contour_id', *FEATURE_BBOX_COLS}
     if not required.issubset(main_df.columns):
-        return {}
+        return {}, {}
 
-    lookup = {}
-    for row in main_df[list(required)].dropna().itertuples(index=False):
-        lookup[(row.file_name_save, row.contour_id)] = (row.min_x, row.min_y, row.max_x, row.max_y)
-    return lookup
+    has_step = 'step' in main_df.columns
+    cols = list(required) + (['step'] if has_step else [])
+
+    by_step, by_id = {}, {}
+    for row in main_df[cols].dropna(subset=list(required)).itertuples(index=False):
+        bbox = (row.min_x, row.min_y, row.max_x, row.max_y)
+        by_id[(row.file_name_save, row.contour_id)] = bbox
+        if has_step and not (isinstance(row.step, float) and np.isnan(row.step)):
+            by_step[(row.file_name_save, row.contour_id, row.step)] = bbox
+    return by_step, by_id
 
 
 def build_feature_tile_crop_image(base_dir, group, task, image_name, min_x, min_y, max_x, max_y, min_display_px=220):
@@ -3590,7 +3600,7 @@ def register_callbacks(app, default_base_dir):
             return placeholder
 
         point = click_data['points'][0]
-        image_name, id_value, min_x, min_y, max_x, max_y = point['customdata']
+        image_name, id_value, min_x, min_y, max_x, max_y, step_value = point['customdata']
         dot_x, dot_y = round_if_float(point['x']), round_if_float(point['y'])
 
         dot_coords_line = html.P([
@@ -3607,11 +3617,21 @@ def register_callbacks(app, default_base_dir):
                     html.Div('No bounding-box coordinates available for this point.', className='status-error'),
                 ])
             try:
-                lookup = get_feature_bbox_lookup(context['base_dir'], context['group'], context['task'])
+                lookup_by_step, lookup_by_id = get_feature_bbox_lookup(
+                    context['base_dir'], context['group'], context['task'],
+                )
             except Exception:
                 return html.Div([dot_coords_line, html.Pre(traceback.format_exc(), className='metrics-box')])
 
-            bbox = lookup.get((image_name, id_value))
+            bbox = None
+            has_step = step_value is not None and not (isinstance(step_value, float) and np.isnan(step_value))
+            if has_step:
+                # contour_id numbering restarts within each step/tile, so matching on
+                # (label_id, step) together is the precise lookup — tried first, with
+                # the looser id-only lookup as a fallback.
+                bbox = lookup_by_step.get((image_name, id_value, step_value))
+            if bbox is None:
+                bbox = lookup_by_id.get((image_name, id_value))
             if bbox is None:
                 return html.Div([
                     dot_coords_line,
