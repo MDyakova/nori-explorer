@@ -53,6 +53,7 @@ for the whole-image overlay and image viewer, `data/`:
 
 ```
 <base_dir>/
+├── explorer_config.json      # optional, see "Hiding groups/tasks" below
 ├── outputs/
 │   └── <group>/
 │       └── <task>/
@@ -81,6 +82,28 @@ for the whole-image overlay and image viewer, `data/`:
 This is separate from the app's own bundled assets under `app/assets/` (the header image
 and the Feature dictionary / AI hypotheses documents below) — those ship with the app and
 don't need to be in your data folder.
+
+### Hiding groups/tasks
+
+If `<base_dir>/explorer_config.json` exists, it can hide groups/tasks you don't want to
+show in the app (e.g. unfinished runs) without deleting or moving anything. Copy
+[`explorer_config.example.json`](explorer_config.example.json) into your data folder as
+`explorer_config.json` and edit it with your own group/task names:
+
+```json
+{
+  "hidden_groups": ["group_a"],
+  "hidden_tasks": {
+    "group_b": ["task_wip", "task_old"]
+  }
+}
+```
+
+- `hidden_groups` — group folder names to drop from the Group dropdown entirely.
+- `hidden_tasks` — per group, task folder names to drop from the Task dropdown.
+
+Both keys are optional; a missing file (or one with neither key) shows everything, same
+as before. Edits take effect on the next page load / group selection — no restart needed.
 
 ## Pages
 

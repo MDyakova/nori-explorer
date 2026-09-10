@@ -63,12 +63,37 @@ def is_valid_base_dir(base_dir):
 
 # --- data loading -----------------------------------------------------
 
+EXPLORER_CONFIG_FILENAME = 'explorer_config.json'
+
+
+def load_explorer_config(base_dir):
+    """Optional <base_dir>/explorer_config.json lets you hide groups/tasks you don't
+    want to show in the app (e.g. unfinished runs) without deleting them:
+
+        {
+          "hidden_groups": ["group_a"],
+          "hidden_tasks": {"group_b": ["task_wip", "task_old"]}
+        }
+
+    A missing file, or any parse error, is treated as "hide nothing"."""
+    path = os.path.join(base_dir, EXPLORER_CONFIG_FILENAME)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def list_groups(base_dir):
-    return sorted(os.listdir(os.path.join(base_dir, 'outputs')))
+    hidden = set(load_explorer_config(base_dir).get('hidden_groups', []))
+    return sorted(g for g in os.listdir(os.path.join(base_dir, 'outputs')) if g not in hidden)
 
 
 def list_tasks(base_dir, group):
-    return sorted(os.listdir(os.path.join(base_dir, 'outputs', group)))
+    hidden = set(load_explorer_config(base_dir).get('hidden_tasks', {}).get(group, []))
+    return sorted(t for t in os.listdir(os.path.join(base_dir, 'outputs', group)) if t not in hidden)
 
 
 def list_models(base_dir, group, task):
@@ -1086,9 +1111,13 @@ def build_pred_age_trend_plot(df, feature_col, pred_col='pred_320', bin_width=0.
 
 # --- statistics page -------------------------------------------------------
 
-# Columns that are identifiers/coordinates, not biological features, and so are
-# excluded when scanning a feature table for "does this differ with age" candidates.
-FEATURE_NON_METRIC_COLS = {'class_name', 'file_name_save', 'sample_name', 'tubule_type', 'nucleolus'} | FEATURE_AGG_DROPPED_COLS
+# Columns that are identifiers/coordinates or the model's own prediction (not a
+# biological feature), and so are excluded when scanning a feature table for "does this
+# differ with age" candidates.
+FEATURE_NON_METRIC_COLS = (
+    {'class_name', 'file_name_save', 'sample_name', 'tubule_type', 'nucleolus', 'pred_320'}
+    | FEATURE_AGG_DROPPED_COLS
+)
 
 
 def benjamini_hochberg(p_values):
@@ -2298,16 +2327,17 @@ def main_page_layout(default_base_dir):
 
         html.Div(className='card', children=[
             html.Div('About this model', className='card-title'),
-            html.P(
+            html.P([
                 'Each model in this tool is a multimodal neural network that predicts the biological '
-                'age (in months) of a kidney tissue tile from four complementary views of the same '
-                'tubule: a protein image, a lipid image, a fluorescent marker image, and a mass-'
-                'spectrometry (MS) spectrum. Combining the four gives a more complete, less ambiguous '
-                'picture of aging than any single modality alone — protein alone, lipid alone, marker '
-                'alone, and MS alone are each easy to confuse across ages, but together they reduce '
-                'uncertainty and improve prediction.',
-                className='model-info-intro',
-            ),
+                'age (in months) of a kidney tissue tile from complementary views of the same tubule: '
+                'a protein image, a lipid image, and a fluorescent marker image, plus an ',
+                html.Strong('optional'), ' mass-spectrometry/proteomics (MS) spectrum when it\'s '
+                'available for a sample. Combining modalities gives a more complete, less ambiguous '
+                'picture of aging than any single one alone — protein alone, lipid alone, or marker '
+                'alone is easy to confuse across ages, but together they reduce uncertainty and '
+                'improve prediction; MS adds unbiased molecular composition on top when present, but '
+                "the model doesn't require it to run.",
+            ], className='model-info-intro'),
             html.Div(className='model-info-grid', children=[
                 html.Div(className='model-info-item', children=[
                     html.H5('Protein (structure)'),
@@ -2324,10 +2354,14 @@ def main_page_layout(default_base_dir):
                     html.P('Highlights molecular pathways, cell states, proliferation, and injury '
                            'response.'),
                 ]),
-                html.Div(className='model-info-item', children=[
-                    html.H5('Mass spectrometry (composition)'),
+                html.Div(className='model-info-item model-info-item-optional', children=[
+                    html.Div(className='model-info-item-header', children=[
+                        html.H5('Mass spectrometry (composition)'),
+                        html.Span('Optional', className='model-info-optional-badge'),
+                    ]),
                     html.P('Unbiased molecular composition — proteins, peptides, lipids — as a 1D '
-                           'spectrum per sample/tile.'),
+                           "spectrum per sample/tile, used when it's available. The model still runs "
+                           'on the three imaging modalities alone when it\'s not.'),
                 ]),
             ]),
             html.P([
