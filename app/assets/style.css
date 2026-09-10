@@ -86,6 +86,22 @@ html, body {
   flex: 1 1 220px;
 }
 
+.btn-group {
+  margin-top: 20px;
+}
+
+.btn-group + .btn-group {
+  margin-top: 16px;
+}
+
+.btn-group-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  margin-bottom: 8px;
+}
+
 .data-folder-row {
   display: flex;
   gap: 10px;
@@ -596,6 +612,111 @@ a.btn-outline:hover {
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
+}
+
+.model-info-intro {
+  margin: 0 0 18px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-text);
+}
+
+.model-info-grid {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.model-info-item {
+  flex: 1 1 200px;
+  background: var(--color-primary-light);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+}
+
+.model-info-item h5 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-primary);
+}
+
+.model-info-item p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--color-text);
+}
+
+.model-info-step {
+  margin: 0 0 12px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-text);
+}
+
+.model-info-step strong {
+  color: var(--color-text);
+}
+
+.model-info-details {
+  border-top: 1px solid var(--color-border);
+  margin-top: 6px;
+  padding-top: 14px;
+}
+
+.model-info-details summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-primary);
+  user-select: none;
+}
+
+.model-info-details summary:hover {
+  color: var(--color-primary-hover);
+}
+
+.model-info-details[open] summary {
+  margin-bottom: 12px;
+}
+
+.pdf-gallery-page {
+  margin-bottom: 20px;
+}
+
+.pdf-gallery-page:last-child {
+  margin-bottom: 0;
+}
+
+.pdf-gallery-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 10px;
+}
+
+.pdf-gallery-link {
+  display: block;
+  line-height: 0;
+}
+
+.pdf-gallery-thumb {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  cursor: zoom-in;
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+
+.pdf-gallery-thumb:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--color-primary);
 }
 
 .table-icon-btn:hover {

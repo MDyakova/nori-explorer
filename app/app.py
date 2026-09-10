@@ -2154,6 +2154,36 @@ def build_umap_figure(umap_df, group, task, model_name):
 
 # --- app / layout ------------------------------------------------------
 
+PDF_REFERENCE_PAGES = [
+    (1, 'Multimodal convolutional neural network', 'page01_img01.jpg'),
+    (2, 'Model pipeline: outputs, segmentation & AI hypothesis agents', 'page02_img01.jpg'),
+    (3, 'Why use multiple modalities?', 'page03_img01.jpg'),
+    (4, 'Why not just stack the images as channels?', 'page04_img01.jpg'),
+    (5, 'Input data and model training with cross-validation', 'page05_img01.jpg'),
+    (6, 'Modality encoders (ResNet50) — detail', 'page06_img01.jpg'),
+    (7, 'What is attention-based fusion?', 'page07_img01.jpg'),
+    (8, 'How the attention mechanism works', 'page08_img01.jpg'),
+    (9, 'What is the CLS token?', 'page09_img01.jpg'),
+    (10, 'Domain-adversarial neural network (DANN)', 'page10_img01.jpg'),
+    (11, 'Multi-agent AI system for explainable morphology analysis', 'page11_img01.jpg'),
+    (12, 'Multi-agent morphology AI — example run', 'page12_img01.jpg'),
+]
+
+
+def build_pdf_reference_gallery():
+    sections = []
+    for page_num, title, fname in PDF_REFERENCE_PAGES:
+        src = f'/assets/model_pdf_images/{fname}'
+        sections.append(html.Div(className='pdf-gallery-page', children=[
+            html.Div(f'{page_num}. {title}', className='pdf-gallery-title'),
+            html.A(
+                html.Img(src=src, className='pdf-gallery-thumb'),
+                href=src, target='_blank', className='pdf-gallery-link',
+            ),
+        ]))
+    return sections
+
+
 def main_page_layout(default_base_dir):
     initial_groups = list_groups(default_base_dir) if is_valid_base_dir(default_base_dir) else []
 
@@ -2196,34 +2226,190 @@ def main_page_layout(default_base_dir):
                     html.Label('Task', className='field-label'),
                     dcc.Dropdown(id='task-dropdown'),
                 ]),
-                html.Div([
-                    html.Label('Model', className='field-label'),
-                    dcc.Dropdown(id='model-dropdown'),
+            ]),
+            html.Div(className='btn-group', children=[
+                html.Div('NoRI images', className='btn-group-label'),
+                html.Div(className='btn-secondary', style={'display': 'flex', 'gap': '10px'}, children=[
+                    html.A(
+                        'Image viewer', id='image-viewer-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
                 ]),
             ]),
-            html.Div(className='btn-secondary', style={'display': 'flex', 'gap': '10px'}, children=[
-                html.Button('Show UMAP', id='show-umap-button', n_clicks=0, className='btn-primary'),
-                html.A(
-                    'Show all model plots', id='view-all-link', href='#', target='_blank',
-                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
-                ),
-                html.A(
-                    'Whole-image overlay', id='overlay-link', href='#', target='_blank',
-                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
-                ),
-                html.A(
-                    'Image viewer', id='image-viewer-link', href='#', target='_blank',
-                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
-                ),
-                html.A(
-                    'Features', id='features-link', href='#', target='_blank',
-                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
-                ),
-                html.A(
-                    'Statistics', id='statistics-link', href='#', target='_blank',
-                    className='btn-primary', style={'background': 'var(--color-text-muted)'},
-                ),
+            html.Div(className='btn-group', children=[
+                html.Div('Model outputs', className='btn-group-label'),
+                html.Div(className='btn-secondary', style={'display': 'flex', 'gap': '10px'}, children=[
+                    html.A(
+                        'Show UMAP', id='umap-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                    html.A(
+                        'Show prediction map', id='overlay-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                    html.A(
+                        'Show all model plots', id='view-all-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                ]),
             ]),
+            html.Div(className='btn-group', children=[
+                html.Div('Extracted features', className='btn-group-label'),
+                html.Div(className='btn-secondary', style={'display': 'flex', 'gap': '10px'}, children=[
+                    html.A(
+                        'Features', id='features-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                    html.A(
+                        'Statistics', id='statistics-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                ]),
+            ]),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('About this model', className='card-title'),
+            html.P(
+                'Each model in this tool is a multimodal neural network that predicts the biological '
+                'age (in months) of a kidney tissue tile from four complementary views of the same '
+                'tubule: a protein image, a lipid image, a fluorescent marker image, and a mass-'
+                'spectrometry (MS) spectrum. Combining the four gives a more complete, less ambiguous '
+                'picture of aging than any single modality alone — protein alone, lipid alone, marker '
+                'alone, and MS alone are each easy to confuse across ages, but together they reduce '
+                'uncertainty and improve prediction.',
+                className='model-info-intro',
+            ),
+            html.Div(className='model-info-grid', children=[
+                html.Div(className='model-info-item', children=[
+                    html.H5('Protein (structure)'),
+                    html.P('Reveals protein localization, cell structure, and tissue architecture '
+                           '(e.g. brush border, junctions).'),
+                ]),
+                html.Div(className='model-info-item', children=[
+                    html.H5('Lipid (metabolism)'),
+                    html.P('Shows lipid accumulation, droplet formation, and changes in cellular '
+                           'metabolism.'),
+                ]),
+                html.Div(className='model-info-item', children=[
+                    html.H5('Fluorescent marker (activity)'),
+                    html.P('Highlights molecular pathways, cell states, proliferation, and injury '
+                           'response.'),
+                ]),
+                html.Div(className='model-info-item', children=[
+                    html.H5('Mass spectrometry (composition)'),
+                    html.P('Unbiased molecular composition — proteins, peptides, lipids — as a 1D '
+                           'spectrum per sample/tile.'),
+                ]),
+            ]),
+            html.P([
+                html.Strong('How the modalities are combined: '),
+                'each image modality is encoded by its own ResNet50 (pretrained on ImageNet) and the '
+                'MS spectrum by a small MLP, producing a 128-dimensional embedding per modality. A '
+                'transformer-style multi-head attention layer — with a learnable "CLS" summary token '
+                '— then fuses the four embeddings, letting the model learn how much to trust each '
+                'modality for a given tile rather than forcing them all to matter equally. This is '
+                'what the "Attention scores by aging group" chart on the UMAP explorer page shows: '
+                'which modality the model leaned on most, by age group.',
+            ], className='model-info-step'),
+            html.P([
+                html.Strong('Outputs: '),
+                'the fused representation feeds two heads — a ', html.Strong('task head'),
+                ' that regresses biological age in months (the "prediction" you see in the UMAP '
+                'explorer and other plots), and a ', html.Strong('domain head'),
+                ' trained adversarially (via a gradient-reversal layer, i.e. domain-adversarial '
+                'training/DANN) to remove batch/dataset effects, so the age-relevant features '
+                'generalize across batches rather than just memorizing which batch a tile came from.',
+            ], className='model-info-step'),
+            html.Details(className='model-info-details', children=[
+                html.Summary('More detail: training and why fusion beats stacking channels'),
+                html.P([
+                    html.Strong('Why not just stack the four images as channels? '),
+                    'Stacking forces very different signal types (structure, metabolism, activity, '
+                    'composition) into the same pixels, with incompatible intensity scales — the '
+                    'model has to disentangle that from scratch, which hurts both accuracy and '
+                    'generalization to new batches/datasets. Keeping each modality separate and '
+                    'fusing them with attention lets the model learn per-modality importance and '
+                    'combine complementary information cleanly, instead of forcing early conflation.',
+                ], className='model-info-step'),
+                html.P([
+                    html.Strong('Training: '),
+                    'each whole-slide sample is split into many overlapping tiles (e.g. 256×256 px); '
+                    'the model is trained per tile via k-fold cross-validation, grouped so that all '
+                    'tiles from one animal/sample stay together in the same fold — an animal is never '
+                    'split between train and validation. Tile-level predictions are then averaged '
+                    '(per fold, and across folds) to get a robust sample-level predicted age.',
+                ], className='model-info-step'),
+                html.P([
+                    html.Strong('What you can explore in this tool: '),
+                    'per-tile heatmaps for each modality (which regions of the tile drove the '
+                    'prediction), attention weights by age group, the UMAP embedding of the fused '
+                    'representation, predicted-age distributions, whole-slide prediction overlays, '
+                    'and — on the Features/Statistics pages — quantitative morphology features '
+                    '(from tubule/nucleus/lumen/lipid-droplet/nucleolus segmentation) tested for '
+                    'age-related trends.',
+                ], className='model-info-step'),
+            ]),
+        ]),
+
+        html.Div(className='card', children=[
+            html.Div('Reference diagrams (from the model explanation deck)', className='card-title'),
+            html.Details(className='model-info-details', children=[
+                html.Summary('More details'),
+                html.P(
+                    'Every diagram from the source slide deck, for a closer look at any step above. '
+                    'Click a diagram to open it full-size in a new tab.',
+                    className='status-text', style={'marginTop': 0, 'marginBottom': '16px'},
+                ),
+                *build_pdf_reference_gallery(),
+            ]),
+        ]),
+    ])
+
+
+def umap_explorer_page_layout(base_dir, group, task):
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
+        return html.Div(className='app-shell', children=[
+            html.A('← Back to explorer', href='/', className='btn-outline'),
+            html.Div(className='app-header', children=[
+                html.H2('UMAP explorer'),
+                html.P('Missing or invalid data folder / group / task. Go back and select them first.'),
+            ]),
+        ])
+
+    try:
+        model_names = list_models(base_dir, group, task)
+    except FileNotFoundError:
+        model_names = []
+
+    return html.Div(className='app-shell', children=[
+        html.A('← Back to explorer', href='/', className='btn-outline'),
+        html.Div(className='app-header', children=[
+            html.H2('UMAP explorer'),
+            html.P(f'{group} / {task}'),
+        ]),
+
+        dcc.Store(id='explorer-context-store', data={
+            'base_dir': base_dir, 'group': group, 'task': task,
+        }),
+        dcc.Store(id='umap-store'),
+
+        html.Div(className='card', children=[
+            html.Div('Selection', className='card-title'),
+            html.Div(className='field-row', children=[
+                html.Div([
+                    html.Label('Model', className='field-label'),
+                    dcc.Dropdown(
+                        id='explorer-model-dropdown',
+                        options=[{'label': m, 'value': m} for m in model_names],
+                        value=model_names[0] if model_names else None,
+                    ),
+                ]),
+            ]),
+            html.Button(
+                'Show UMAP', id='explorer-show-button', n_clicks=0,
+                className='btn-primary', style={'marginTop': '10px'},
+            ),
         ]),
 
         html.Div(className='card', children=[
@@ -2235,8 +2421,6 @@ def main_page_layout(default_base_dir):
             html.Div('Attention scores by aging group', className='card-title'),
             plot_with_toolbar(html.Img(id='attn-boxplots-img', className='boxplot-img'), 'attention_boxplots'),
         ]),
-
-        dcc.Store(id='umap-store'),
 
         html.Div(className='card', children=[
             html.Div('UMAP embedding', className='card-title'),
@@ -2769,18 +2953,26 @@ def statistics_page_layout(base_dir, group, task):
     ])
 
 
-def whole_image_overlay_page_layout(base_dir, group, task, model):
-    if not (base_dir and group and task and model and is_valid_base_dir(base_dir)):
+def whole_image_overlay_page_layout(base_dir, group, task, model=''):
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
         return html.Div(className='app-shell', children=[
             html.A('← Back to explorer', href='/', className='btn-outline'),
             html.Div(className='app-header', children=[
                 html.H2('Whole-image prediction overlay'),
-                html.P('Missing or invalid data folder / group / task / model. Go back and select them first.'),
+                html.P('Missing or invalid data folder / group / task. Go back and select them first.'),
             ]),
         ])
 
     try:
-        whole_images = list_whole_images(base_dir, group, task, model)
+        model_names = list_models(base_dir, group, task)
+    except FileNotFoundError:
+        model_names = []
+
+    if model not in model_names:
+        model = model_names[0] if model_names else None
+
+    try:
+        whole_images = list_whole_images(base_dir, group, task, model) if model else []
         list_error = None
     except Exception:
         whole_images = []
@@ -2803,6 +2995,14 @@ def whole_image_overlay_page_layout(base_dir, group, task, model):
             html.Div('Selection', className='card-title'),
             html.Div(f'Looking for images in: {data_group_dir}', className='status-text'),
             html.Div(className='field-row', style={'marginTop': '14px'}, children=[
+                html.Div([
+                    html.Label('Model', className='field-label'),
+                    dcc.Dropdown(
+                        id='overlay-model-dropdown',
+                        options=[{'label': m, 'value': m} for m in model_names],
+                        value=model,
+                    ),
+                ]),
                 html.Div([
                     html.Label('Image', className='field-label'),
                     dcc.Dropdown(
@@ -3060,6 +3260,8 @@ def register_callbacks(app, default_base_dir):
         group = params.get('group', [''])[0]
         task = params.get('task', [''])[0]
 
+        if pathname == '/explorer':
+            return umap_explorer_page_layout(base_dir, group, task)
         if pathname == '/all-umaps':
             return all_umaps_page_layout(base_dir, group, task)
         if pathname == '/whole-image-overlay':
@@ -3072,6 +3274,18 @@ def register_callbacks(app, default_base_dir):
         if pathname == '/statistics':
             return statistics_page_layout(base_dir, group, task)
         return main_page_layout(default_base_dir)
+
+    @app.callback(
+        Output('umap-link', 'href'),
+        Input('base-dir-store', 'data'),
+        Input('group-dropdown', 'value'),
+        Input('task-dropdown', 'value'),
+    )
+    def update_umap_link(base_dir, group, task):
+        if not (base_dir and group and task):
+            return '#'
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
+        return f'/explorer?{query}'
 
     @app.callback(
         Output('view-all-link', 'href'),
@@ -3090,12 +3304,11 @@ def register_callbacks(app, default_base_dir):
         Input('base-dir-store', 'data'),
         Input('group-dropdown', 'value'),
         Input('task-dropdown', 'value'),
-        Input('model-dropdown', 'value'),
     )
-    def update_overlay_link(base_dir, group, task, model):
-        if not (base_dir and group and task and model):
+    def update_overlay_link(base_dir, group, task):
+        if not (base_dir and group and task):
             return '#'
-        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task, 'model': model})
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
         return f'/whole-image-overlay?{query}'
 
     @app.callback(
@@ -3457,6 +3670,29 @@ def register_callbacks(app, default_base_dir):
     )
 
     @app.callback(
+        Output('overlay-context-store', 'data'),
+        Output('overlay-image-dropdown', 'options'),
+        Output('overlay-image-dropdown', 'value'),
+        Input('overlay-model-dropdown', 'value'),
+        State('overlay-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_overlay_model(model, context):
+        if not (context and model):
+            return dash.no_update, dash.no_update, dash.no_update
+
+        base_dir, group, task = context['base_dir'], context['group'], context['task']
+        try:
+            whole_images = list_whole_images(base_dir, group, task, model)
+        except Exception:
+            whole_images = []
+
+        new_context = {**context, 'model': model}
+        options = [{'label': img, 'value': img} for img in whole_images]
+        value = whole_images[0] if whole_images else None
+        return new_context, options, value
+
+    @app.callback(
         Output('overlay-status', 'children'),
         Output('overlay-image', 'src'),
         Output('overlay-colorbar', 'src'),
@@ -3774,32 +4010,20 @@ def register_callbacks(app, default_base_dir):
         return [{'label': t, 'value': t} for t in tasks], (tasks[0] if tasks else None)
 
     @app.callback(
-        Output('model-dropdown', 'options'),
-        Output('model-dropdown', 'value'),
-        Input('task-dropdown', 'value'),
-        State('group-dropdown', 'value'),
-        State('base-dir-store', 'data'),
-    )
-    def update_models(task, group, base_dir):
-        if not (base_dir and group and task):
-            return [], None
-        models = list_models(base_dir, group, task)
-        return [{'label': m, 'value': m} for m in models], (models[0] if models else None)
-
-    @app.callback(
         Output('umap-store', 'data'),
         Output('metrics-output', 'children'),
         Output('umap-scatter', 'figure'),
         Output('attn-boxplots-img', 'src'),
-        Input('show-umap-button', 'n_clicks'),
-        State('model-dropdown', 'value'),
-        State('group-dropdown', 'value'),
-        State('task-dropdown', 'value'),
-        State('base-dir-store', 'data'),
+        Input('explorer-show-button', 'n_clicks'),
+        State('explorer-model-dropdown', 'value'),
+        State('explorer-context-store', 'data'),
+        prevent_initial_call=True,
     )
-    def update_umap(n_clicks, model_name, group, task, base_dir):
-        if not (n_clicks and base_dir and group and task and model_name):
+    def update_umap(n_clicks, model_name, context):
+        if not (n_clicks and context and model_name):
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+        base_dir, group, task = context['base_dir'], context['group'], context['task']
 
         try:
             umap_df = load_umap_df(base_dir, group, task, model_name)
@@ -3835,9 +4059,10 @@ def register_callbacks(app, default_base_dir):
         Output('image-panel-output', 'children'),
         Input('umap-scatter', 'clickData'),
         State('umap-store', 'data'),
-        State('base-dir-store', 'data'),
+        State('explorer-context-store', 'data'),
     )
-    def display_selected_tile(click_data, store_data, base_dir):
+    def display_selected_tile(click_data, store_data, context):
+        base_dir = (context or {}).get('base_dir')
         if not click_data or not store_data or not base_dir:
             return html.Div('Click a point in the UMAP plot to inspect a tile.', className='tile-placeholder')
 
