@@ -143,14 +143,14 @@ def compute_metrics(base_dir, umap_df, group, task):
 
 # --- features data helpers -----------------------------------------------
 
-# Each image_name in outputs/<group>/<task>/features/ has up to three CSVs: the
-# tubule-level table itself (<image_name>.csv), and two suffixed side tables.
+# outputs/<group>/<task>/features/ holds one combined CSV per feature kind, covering
+# every sample/image at once (rows are told apart by the file_name_save column).
 FEATURE_KINDS = {
-    'main': 'Tubule features (<image_name>.csv)',
-    'nucleolus': 'Nucleolus features (<image_name>_nucleolus.csv)',
-    'shape': 'Shape features (<image_name>_shape.csv)',
+    'main': 'Tubule features (tubule_features.csv)',
+    'nuclei': 'Nuclei features (nuclei_features.csv)',
+    'shape': 'Shape features (shape_features.csv)',
 }
-_FEATURE_SUFFIXES = {'main': '.csv', 'nucleolus': '_nucleolus.csv', 'shape': '_shape.csv'}
+_FEATURE_FILENAMES = {'main': 'tubule_features.csv', 'nuclei': 'nuclei_features.csv', 'shape': 'shape_features.csv'}
 
 FEATURE_AGGREGATION_LEVELS = {
     'tubule': 'Tubules (not aggregated)',
@@ -164,49 +164,30 @@ FEATURE_AGGREGATION_LEVELS = {
 # dropped rather than averaged whenever an aggregation level other than 'tubule' is used.
 FEATURE_AGG_DROPPED_COLS = {'contour_id', 'label_id', 'min_x', 'min_y', 'max_x', 'max_y', 'step', 'step_n'}
 
-
 def features_dir_path(base_dir, group, task):
     return os.path.join(base_dir, 'outputs', group, task, 'features')
 
 
-def list_feature_files(base_dir, group, task, kind):
-    """[(image_name, path), ...] for feature files of `kind` ('main'/'nucleolus'/'shape')."""
-    feat_dir = features_dir_path(base_dir, group, task)
-    if not os.path.isdir(feat_dir):
-        return []
-
-    suffix = _FEATURE_SUFFIXES[kind]
-    other_suffixes = [s for k, s in _FEATURE_SUFFIXES.items() if k != kind and s != '.csv']
-
-    items = []
-    for fname in sorted(os.listdir(feat_dir)):
-        if not fname.endswith('.csv'):
-            continue
-        if kind == 'main':
-            if any(fname.endswith(s) for s in other_suffixes):
-                continue
-            image_name = fname[:-len('.csv')]
-        else:
-            if not fname.endswith(suffix):
-                continue
-            image_name = fname[:-len(suffix)]
-        items.append((image_name, os.path.join(feat_dir, fname)))
-    return items
+def feature_file_path(base_dir, group, task, kind):
+    return os.path.join(features_dir_path(base_dir, group, task), _FEATURE_FILENAMES[kind])
 
 
 def list_feature_kinds_available(base_dir, group, task):
-    return [kind for kind in FEATURE_KINDS if list_feature_files(base_dir, group, task, kind)]
+    return [
+        kind for kind in FEATURE_KINDS
+        if os.path.isfile(feature_file_path(base_dir, group, task, kind))
+    ]
 
 
 def get_feature_columns(base_dir, group, task, kind, level='tubule'):
-    """Column names for `kind`, read from just the first file (schema is shared). At an
-    aggregated `level`, the bbox/id columns that get dropped by aggregate_feature_table
-    are excluded so they can't be picked for a plot in the first place."""
-    files = list_feature_files(base_dir, group, task, kind)
-    if not files:
+    """Column names for `kind`'s combined feature file. At an aggregated `level`, the
+    bbox/id columns that get dropped by aggregate_feature_table are excluded so they
+    can't be picked for a plot in the first place."""
+    path = feature_file_path(base_dir, group, task, kind)
+    if not os.path.isfile(path):
         return []
     try:
-        columns = list(pd.read_csv(files[0][1], nrows=0).columns)
+        columns = list(pd.read_csv(path, nrows=0).columns)
     except Exception:
         return []
     if 'file_name_save' in columns and 'sample_name' not in columns:
@@ -228,11 +209,11 @@ def get_feature_text_columns(base_dir, group, task, kind, level='tubule'):
     columns = get_feature_columns(base_dir, group, task, kind, level)
     if not columns:
         return []
-    files = list_feature_files(base_dir, group, task, kind)
-    if not files:
+    path = feature_file_path(base_dir, group, task, kind)
+    if not os.path.isfile(path):
         return []
     try:
-        sample = pd.read_csv(files[0][1], nrows=500)
+        sample = pd.read_csv(path, nrows=500)
     except Exception:
         return []
     return [
@@ -242,28 +223,27 @@ def get_feature_text_columns(base_dir, group, task, kind, level='tubule'):
 
 
 def list_feature_column_values(base_dir, group, task, kind, column):
-    """Distinct string values of `column`, read across every image's feature file of
-    `kind` (not just the first — values like file_name_save/sample_name differ per
-    image), for populating the Filter value picker."""
+    """Distinct string values of `column` in `kind`'s combined feature file, for
+    populating the Filter value picker."""
     if not column:
         return []
-    values = set()
-    for image_name, path in list_feature_files(base_dir, group, task, kind):
-        try:
-            if column == 'sample_name':
-                col_df = pd.read_csv(path, usecols=lambda c: c == 'file_name_save')
-                if 'file_name_save' not in col_df.columns:
-                    continue
-                vals = col_df['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
-            else:
-                col_df = pd.read_csv(path, usecols=lambda c: c == column)
-                if column not in col_df.columns:
-                    continue
-                vals = col_df[column]
-        except Exception:
-            continue
-        values.update(str(v) for v in vals.dropna().unique().tolist())
-    return sorted(values)
+    path = feature_file_path(base_dir, group, task, kind)
+    if not os.path.isfile(path):
+        return []
+    try:
+        if column == 'sample_name':
+            col_df = pd.read_csv(path, usecols=lambda c: c == 'file_name_save')
+            if 'file_name_save' not in col_df.columns:
+                return []
+            vals = col_df['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
+        else:
+            col_df = pd.read_csv(path, usecols=lambda c: c == column)
+            if column not in col_df.columns:
+                return []
+            vals = col_df[column]
+    except Exception:
+        return []
+    return sorted(str(v) for v in vals.dropna().unique().tolist())
 
 
 def apply_feature_filter(df, column, values):
@@ -309,30 +289,25 @@ def aggregate_feature_table(df, level):
 
 
 def load_feature_table(base_dir, group, task, kind):
-    """Concatenate every image's feature file of `kind` into one dataframe, adding a
+    """Load `kind`'s combined feature file (already covers every sample), adding a
     `sample_name` (animal) column derived the same way the umap CSVs' sample_name is."""
-    frames = []
-    for image_name, path in list_feature_files(base_dir, group, task, kind):
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            continue
-        if 'file_name_save' not in df.columns:
-            df['file_name_save'] = image_name
-        frames.append(df)
-
-    if not frames:
+    path = feature_file_path(base_dir, group, task, kind)
+    if not os.path.isfile(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
         return pd.DataFrame()
 
-    combined = pd.concat(frames, ignore_index=True)
-    combined['sample_name'] = combined['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
+    if 'file_name_save' in df.columns:
+        df['sample_name'] = df['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
 
-    if 'class_name' in combined.columns:
-        combined['class_name'] = combined['class_name'].astype(int)
-        combined.sort_values(by=['class_name'], inplace=True)
-        combined['class_name'] = combined['class_name'].astype(str)
+    if 'class_name' in df.columns:
+        df['class_name'] = df['class_name'].astype(int)
+        df.sort_values(by=['class_name'], inplace=True)
+        df['class_name'] = df['class_name'].astype(str)
 
-    return combined
+    return df
 
 
 # Columns available for the "Predicted-age trend" plot: the main tubule table's own
@@ -821,7 +796,7 @@ FEATURE_BBOX_COLS = ('min_x', 'min_y', 'max_x', 'max_y')
 def build_feature_scatter_figure(df, x_col, y_col, hue_col=None):
     """Interactive scatter (like the UMAP embedding plot) — each point's customdata
     carries its image name plus either its own bounding box (the main tubule table) or
-    its row id (nucleolus/shape tables, resolved against the main table on click), so a
+    its row id (nuclei/shape tables, resolved against the main table on click), so a
     click can look up and crop the source protein/lipid image."""
     id_col = next((c for c in FEATURE_ROW_ID_COLS if c in df.columns), None)
     has_bbox = all(c in df.columns for c in FEATURE_BBOX_COLS)
@@ -876,7 +851,7 @@ def build_feature_scatter_figure(df, x_col, y_col, hue_col=None):
 
 def get_feature_bbox_lookup(base_dir, group, task):
     """(file_name_save, contour_id) -> (min_x, min_y, max_x, max_y), from the main
-    tubule-level feature table. The nucleolus/shape tables don't carry bbox columns
+    tubule-level feature table. The nuclei/shape tables don't carry bbox columns
     themselves but share this id (as `label_id`) with the main table's `contour_id`."""
     main_df = load_feature_table(base_dir, group, task, 'main')
     if main_df.empty:
@@ -2228,9 +2203,12 @@ def main_page_layout(default_base_dir):
     initial_groups = list_groups(default_base_dir) if is_valid_base_dir(default_base_dir) else []
 
     return html.Div(className='app-shell', children=[
-        html.Div(className='app-header', children=[
-            html.H2('NoRI Interactive Regression Explorer'),
-            html.P('Explore UMAP embeddings, prediction quality, and attention scores across aging groups.'),
+        html.Div(className='hero-banner', children=[
+            html.Img(src='/assets/header_image/kidney.jpg', className='hero-banner-img'),
+            html.Div(className='hero-banner-overlay', children=[
+                html.H2('NoRI Interactive Regression Explorer'),
+                html.P('Explore UMAP embeddings, prediction quality, and attention scores across aging groups.'),
+            ]),
         ]),
 
         html.Div(className='card', children=[
@@ -2653,7 +2631,19 @@ def all_umaps_page_layout(base_dir, group, task):
 def features_page_layout(base_dir, group, task):
     if not (base_dir and group and task and is_valid_base_dir(base_dir)):
         return html.Div(className='app-shell', children=[
-            html.A('← Back to explorer', href='/', className='btn-outline'),
+            html.Div(className='top-links-row', children=[
+                html.A('← Back to explorer', href='/', className='btn-outline'),
+                html.Div(className='top-links-group', children=[
+                    html.A(
+                        'Feature dictionary ↗', href='/assets/md_files/nori_kidney_feature_dictionary.html', target='_blank',
+                        className='btn-outline',
+                    ),
+                    html.A(
+                        'AI hypotheses ↗', href='/assets/md_files/nori_kidney_aging_confident_hypotheses.html', target='_blank',
+                        className='btn-outline',
+                    ),
+                ]),
+            ]),
             html.Div(className='app-header', children=[
                 html.H2('Features'),
                 html.P('Missing or invalid data folder / group / task. Go back and select them first.'),
@@ -2698,7 +2688,19 @@ def features_page_layout(base_dir, group, task):
     pred_trend_features = list_pred_age_trend_features(base_dir, group, task)
 
     return html.Div(className='app-shell', children=[
-        html.A('← Back to explorer', href='/', className='btn-outline'),
+        html.Div(className='top-links-row', children=[
+            html.A('← Back to explorer', href='/', className='btn-outline'),
+            html.Div(className='top-links-group', children=[
+                html.A(
+                    'Feature dictionary ↗', href='/assets/md_files/nori_kidney_feature_dictionary.html', target='_blank',
+                    className='btn-outline',
+                ),
+                html.A(
+                    'AI hypotheses ↗', href='/assets/md_files/nori_kidney_aging_confident_hypotheses.html', target='_blank',
+                    className='btn-outline',
+                ),
+            ]),
+        ]),
         html.Div(className='app-header', children=[
             html.H2('Features'),
             html.P(f'{group} / {task}'),
@@ -3489,7 +3491,6 @@ def register_callbacks(app, default_base_dir):
             filter_columns = get_feature_text_columns(
                 context['base_dir'], context['group'], context['task'], kind, level or 'tubule',
             )
-            n_files = len(list_feature_files(context['base_dir'], context['group'], context['task'], kind))
         except Exception:
             return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
 
@@ -3511,7 +3512,7 @@ def register_callbacks(app, default_base_dir):
         hue_options = [{'label': '(none)', 'value': ''}] + column_options
         default_x = columns[0]
         default_y = columns[1] if len(columns) > 1 else columns[0]
-        status = html.Span(f'{len(columns)} column(s) across {n_files} image(s).', className='status-ok')
+        status = html.Span(f'{len(columns)} column(s) available.', className='status-ok')
 
         return (
             status,

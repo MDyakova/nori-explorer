@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NoRI Kidney Aging — Confident Biological Hypotheses</title>
+<style>
+:root{
+  --bg:#f6f8fb;
+  --card:#ffffff;
+  --text:#1f2937;
+  --muted:#667085;
+  --line:#e5e7eb;
+  --accent:#254b8b;
+  --vs-bg:#dcfce7; --vs:#166534;
+  --s-bg:#dbeafe; --s:#1d4ed8;
+  --ms-bg:#fef3c7; --ms:#92400e;
+  --m-bg:#ffedd5; --m:#9a3412;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  line-height:1.65;
+}
+.container{
+  max-width:1100px;
+  margin:0 auto;
+  padding:42px 24px 80px;
+}
+h1{font-size:2.25rem;line-height:1.2;margin:0 0 12px;color:#132238}
+h2{margin-top:48px;color:#17345f;border-bottom:2px solid #dbe3ef;padding-bottom:8px}
+h3{margin-top:0;color:#1d3557;font-size:1.25rem}
+p{margin:8px 0 12px}
+table{
+  width:100%;
+  border-collapse:collapse;
+  background:var(--card);
+  border-radius:12px;
+  overflow:hidden;
+  box-shadow:0 3px 14px rgba(0,0,0,.06);
+}
+th,td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:#eef3f9;text-align:left;color:#223b5f}
+tr:last-child td{border-bottom:none}
+section{
+  background:var(--card);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:22px 24px;
+  margin:18px 0;
+  box-shadow:0 2px 10px rgba(0,0,0,.035);
+}
+.legend{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 22px}
+.legend span,.very-strong,.strong,.moderate-strong,.moderate{
+  display:inline-block;
+  padding:3px 9px;
+  border-radius:999px;
+  font-weight:650;
+  font-size:.88rem;
+}
+.very-strong{background:var(--vs-bg);color:var(--vs)}
+.strong{background:var(--s-bg);color:var(--s)}
+.moderate-strong{background:var(--ms-bg);color:var(--ms)}
+.moderate{background:var(--m-bg);color:var(--m)}
+.note,.highlight{
+  background:#eef4ff;
+  border-left:5px solid var(--accent);
+  padding:16px 18px;
+  border-radius:9px;
+  margin:20px 0;
+}
+code{
+  background:#f1f5f9;
+  padding:2px 6px;
+  border-radius:5px;
+  font-size:.93em;
+}
+.flow{
+  display:flex;
+  gap:12px;
+  align-items:stretch;
+  flex-wrap:wrap;
+  margin:22px 0;
+}
+.flow>div:not(.arrow){
+  flex:1 1 190px;
+  background:white;
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:17px;
+  text-align:center;
+}
+.arrow{display:flex;align-items:center;font-size:1.6rem;color:#789}
+@media (max-width:760px){
+  .container{padding:24px 14px 60px}
+  h1{font-size:1.8rem}
+  table{font-size:.88rem;display:block;overflow-x:auto}
+  .arrow{display:none}
+}
+@media print{
+  body{background:white}
+  .container{max-width:none;padding:0}
+  section,table{box-shadow:none}
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>NoRI Kidney Aging — Confident Biological Hypotheses</h1>
+
+<p>This document consolidates the kidney-aging hypotheses developed from the NoRI predicted-age maps, Grad-CAM observations, pathologist review, and quantitative feature discussions.</p>
+
+<div class="legend">
+  <span class="very-strong">Very strong</span>
+  <span class="strong">Strong</span>
+  <span class="moderate-strong">Moderate–Strong</span>
+  <span class="moderate">Moderate</span>
+</div>
+
+<div class="note">
+  <strong>Important:</strong> “Appears” refers to the age at which the phenotype becomes visually apparent or prominent in the current observations, not a statistically established onset.
+</div>
+
+<h2>Summary</h2>
+<table>
+<thead>
+<tr><th>#</th><th>Hypothesis</th><th>Age where it appears / progression</th><th>Strength</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>Spatially heterogeneous / focal kidney aging</td><td>Begins ~18m; expands 21m; widespread 25m</td><td><span class="very-strong">Very strong</span></td></tr>
+<tr><td>2</td><td>Loss of epithelial compartmentalization / polarity</td><td>Begins ~18m; stronger 21–25m</td><td><span class="very-strong">Very strong</span></td></tr>
+<tr><td>3</td><td>Brush-border deterioration</td><td>Begins ~18m; stronger 21–25m</td><td><span class="very-strong">Very strong</span></td></tr>
+<tr><td>4</td><td>Tubular degeneration / architectural instability</td><td>Begins ~18m; prominent 21–25m</td><td><span class="very-strong">Very strong</span></td></tr>
+<tr><td>5</td><td>Lumen-boundary degradation</td><td>Begins ~18m; stronger 21–25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>6</td><td>Outer tubule-boundary degradation</td><td>Begins ~18m; prominent 21–25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>7</td><td>Increasing tissue / cellular heterogeneity</td><td>Emerges 18m; pronounced 21–25m</td><td><span class="very-strong">Very strong</span></td></tr>
+<tr><td>8</td><td>Localized protein depletion / redistribution</td><td>Visible from ~18m; stronger 21–25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>9</td><td>Protein texture becomes fragmented / granular</td><td>~18m onward</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>10</td><td>Loss of lipid homeostasis / disorganized lipid distribution</td><td>Early redistribution ~18m; clear 21–25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>11</td><td>Protein–lipid spatial coordination decreases</td><td>Mainly 21–25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>12</td><td>Nephron segments differ in aging susceptibility / heterogeneity</td><td>18–25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>13</td><td>Collecting tubules contain a strong aging signal</td><td>Most notable around 21m</td><td><span class="moderate-strong">Moderate–Strong</span></td></tr>
+<tr><td>14</td><td>Glomerular remodeling contributes to biological aging</td><td>~18m onward; stronger 21–25m</td><td><span class="moderate-strong">Moderate–Strong</span></td></tr>
+<tr><td>15</td><td>Vascular remodeling contributes to age-associated predictions</td><td>Mainly 21–25m</td><td><span class="moderate">Moderate</span></td></tr>
+<tr><td>16</td><td>Interstitial / stromal remodeling increases with advanced age</td><td>Mainly 21–25m, strongest 25m</td><td><span class="strong">Strong</span></td></tr>
+<tr><td>17</td><td>21 months is a transition / remodeling state</td><td>21m</td><td><span class="very-strong">Very strong</span></td></tr>
+<tr><td>18</td><td>Young-like microdomains persist in old kidneys</td><td>Particularly 25m</td><td><span class="strong">Strong</span></td></tr>
+</tbody>
+</table>
+
+<h2>Detailed hypotheses</h2>
+
+<section>
+<h3>1. Spatially heterogeneous / focal kidney aging</h3>
+<p><strong>Hypothesis.</strong> Kidney aging does not occur uniformly. Local regions acquire an older biological phenotype before the surrounding tissue, and these microdomains expand and coalesce with age.</p>
+<p><strong>Age progression.</strong> 9m: relatively homogeneous predictions close to chronological age. 18m: focal older-predicted microdomains emerge. 21m: these regions become larger and more connected. 25m: old predictions are widespread, although younger-like islands remain.</p>
+<p><strong>Features to compute.</strong> Predicted-age SD, IQR, MAD, robust CV; fraction of accelerated-aging tubules; old-region area fraction; number and size of connected old clusters; largest old-cluster fraction; Moran’s I; Geary’s C; young-island fraction and size.</p>
+<p><strong>Strength.</strong> <span class="very-strong">Very strong</span></p>
+</section>
+
+<section>
+<h3>2. Loss of epithelial compartmentalization / apical–basal polarity</h3>
+<p><strong>Hypothesis.</strong> Aging disrupts the normal spatial organization of protein and lipid across tubular epithelial cells.</p>
+<p><strong>Age progression.</strong> Organized at 9m; early disruption around 18m; clear heterogeneous remodeling at 21m; widespread disorganization at 25m.</p>
+<p><strong>Features to compute.</strong> <code>protein_apical_basal_ratio</code>, <code>lipid_apical_basal_ratio</code>, <code>protein_radial_gradient</code>, <code>lipid_radial_gradient</code>, <code>protein_lipid_radial_correlation</code>.</p>
+<p><strong>Expected result.</strong> Radial organization weakens or becomes more variable with age.</p>
+<p><strong>Strength.</strong> <span class="very-strong">Very strong</span></p>
+</section>
+
+<section>
+<h3>3. Brush-border deterioration</h3>
+<p><strong>Hypothesis.</strong> The proximal-tubule brush border progressively loses coverage, continuity, and structural integrity during aging.</p>
+<p><strong>Age progression.</strong> Relatively intact at 9m; early irregularity at 18m; increased fragmentation at 21m; substantial disruption at 25m.</p>
+<p><strong>Features to compute.</strong> <code>brush_border_coverage</code>, <code>brush_fraction</code>, <code>brush_fragmentation</code>, <code>largest_brush_component_fraction</code>, <code>brush_thickness</code>, optional <code>brush_gap_fraction</code>.</p>
+<p><strong>Expected result.</strong> Coverage ↓, brush fraction ↓, fragmentation ↑, largest connected component ↓.</p>
+<p><strong>Strength.</strong> <span class="very-strong">Very strong</span></p>
+</section>
+
+<section>
+<h3>4. Tubular degeneration and architectural instability</h3>
+<p><strong>Hypothesis.</strong> Tubular architecture progressively loses organization, producing irregular, deformed, broken, and eventually collapsed structures.</p>
+<p><strong>Age progression.</strong> 9m organized; 18m early defects; 21m focal structural failure; 25m widespread degeneration.</p>
+<p><strong>Features to compute.</strong> <code>tubule_radial_roughness_cv</code>, <code>tubule_concavity_fraction</code>, <code>tubule_solidity</code>, <code>epithelial_thickness_cv</code>, <code>tubule_eccentricity</code>, <code>tubule_perimeter_area_ratio</code>.</p>
+<p><strong>Expected result.</strong> Roughness ↑, concavity ↑, thickness variability ↑, perimeter/area ↑, solidity ↓.</p>
+<p><strong>Strength.</strong> <span class="very-strong">Very strong</span></p>
+</section>
+
+<section>
+<h3>5. Lumen-boundary degradation</h3>
+<p><strong>Hypothesis.</strong> The lumen-facing epithelial surface becomes rougher, more indented, and less regular with age.</p>
+<p><strong>Age progression.</strong> First clearly apparent around 18m and stronger at 21–25m.</p>
+<p><strong>Features to compute.</strong> <code>radial_roughness_cv</code>, <code>concavity_fraction</code>, lumen circularity, lumen solidity, invagination count/depth, lumen perimeter-to-area ratio.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>6. Outer tubule-boundary degradation</h3>
+<p><strong>Hypothesis.</strong> Aging affects the external tubule contour, reflecting epithelial wall deformation and local tissue remodeling.</p>
+<p><strong>Age progression.</strong> Early changes at 18m; increased deformation at 21m; pronounced irregularity/collapse at 25m.</p>
+<p><strong>Features to compute.</strong> <code>tubule_radial_roughness_cv</code>, <code>tubule_concavity_fraction</code>, <code>tubule_solidity</code>, <code>tubule_eccentricity</code>, <code>tubule_perimeter_area_ratio</code>, <code>epithelial_thickness_cv</code>.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>7. Increasing tissue and cellular heterogeneity</h3>
+<p><strong>Hypothesis.</strong> A major property of kidney aging is increasing heterogeneity: neighboring cells and tubules increasingly occupy different biological states rather than changing synchronously.</p>
+<p><strong>Age progression.</strong> 9m relatively homogeneous; 18m heterogeneity emerges; 21m strong mixture of young-like and old-like structures; 25m old phenotype dominates but local variability persists.</p>
+<p><strong>Features to compute.</strong> Predicted-age SD/IQR/MAD; <code>robust_cv_protein</code>; <code>robust_cv_lipid</code>; cell-to-cell CV; within-animal feature variance; fraction of accelerated-aging tubules.</p>
+<p><strong>Strength.</strong> <span class="very-strong">Very strong</span></p>
+</section>
+
+<section>
+<h3>8. Localized protein depletion / redistribution</h3>
+<p><strong>Hypothesis.</strong> Aging produces subsets of epithelial cells with reduced cytoplasmic protein signal rather than a simple uniform decline across all cells.</p>
+<p><strong>Age progression.</strong> Begins around 18m; mixed high/low-protein populations are prominent at 21m; extensive abnormal regions appear at 25m.</p>
+<p><strong>Features to compute.</strong> Median cytoplasmic protein per cell; number and fraction of protein-depleted cells per tubule; <code>robust_cv_protein</code>; depleted-cell cluster size; largest depleted-cell cluster.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>9. Protein texture becomes fragmented / granular</h3>
+<p><strong>Hypothesis.</strong> Cytoplasmic protein organization changes from relatively smooth to increasingly fragmented or granular with age.</p>
+<p><strong>Age progression.</strong> Detectable around 18m and increasingly apparent at 21–25m.</p>
+<p><strong>Features to compute.</strong> <code>protein_texture_roughness</code>, high-frequency residual intensity, local protein variance, entropy, <code>robust_cv_protein</code>, aggregate/granule number and size.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>10. Loss of lipid homeostasis / disorganized lipid distribution</h3>
+<p><strong>Hypothesis.</strong> Aging alters lipid organization rather than simply increasing total lipid. Organized lipid distribution becomes increasingly patchy and lesion-associated.</p>
+<p><strong>Age progression.</strong> 9m organized distribution; 18m early redistribution; 21m lipid clusters/debris; 25m prominent lipid-rich cytoplasm and droplets.</p>
+<p><strong>Features to compute.</strong> <code>robust_cv_lipid</code>, <code>lipid_texture_roughness</code>, lipid-droplet number, area and size distribution, lipid-rich area fraction, <code>lipid_apical_basal_ratio</code>, <code>lipid_radial_gradient</code>.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>11. Protein–lipid spatial coordination decreases</h3>
+<p><strong>Hypothesis.</strong> Normal spatial relationships between protein and lipid become less coordinated as epithelial organization deteriorates.</p>
+<p><strong>Age progression.</strong> Possible early disruption at 18m; strongest expected at 21–25m.</p>
+<p><strong>Features to compute.</strong> <code>protein_lipid_radial_correlation</code>, within-tubule pixel-level protein/lipid correlation, boundary correlation, spatial cross-correlation.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span>, quantitative confirmation still needed.</p>
+</section>
+
+<section>
+<h3>12. Nephron segments differ in aging susceptibility / heterogeneity</h3>
+<p><strong>Hypothesis.</strong> Proximal, distal, and collecting tubules all undergo aging, but the magnitude, timing, and phenotype differ by segment.</p>
+<p><strong>Age progression.</strong> Segment differences are most informative from 18–25m.</p>
+<p><strong>Features to compute.</strong> Predicted biological age by tubule type, prediction error, variance/IQR, accelerated-aging fraction, protein/lipid heterogeneity, brush-border and architecture features by segment, age × tubule-type interaction.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>13. Collecting tubules contain a strong aging signal</h3>
+<p><strong>Hypothesis.</strong> Collecting tubules contain substantial age-associated information and may show particularly heterogeneous remodeling at intermediate ages.</p>
+<p><strong>Age progression.</strong> Particularly interesting around 21m.</p>
+<p><strong>Features to compute.</strong> Median predicted age by tubule type, prediction variance/IQR, fraction predicted older than chronological age, per-animal prediction error, protein/lipid heterogeneity, architecture metrics.</p>
+<p><strong>Important limitation.</strong> Current data do not establish that collecting tubules globally age faster than proximal or distal tubules.</p>
+<p><strong>Strength.</strong> <span class="moderate-strong">Moderate–Strong</span></p>
+</section>
+
+<section>
+<h3>14. Glomerular remodeling contributes to biological aging</h3>
+<p><strong>Hypothesis.</strong> Structural and biochemical remodeling of glomeruli contributes to the age-prediction signal.</p>
+<p><strong>Age progression.</strong> Visible from approximately 18m, with stronger abnormalities at 21–25m.</p>
+<p><strong>Features to compute.</strong> Glomerular area, circularity, solidity, capillary/lumen fraction, empty-space fraction, protein/lipid levels and heterogeneity, boundary roughness, Grad-CAM overlap.</p>
+<p><strong>Strength.</strong> <span class="moderate-strong">Moderate–Strong</span></p>
+</section>
+
+<section>
+<h3>15. Vascular remodeling contributes to aging</h3>
+<p><strong>Hypothesis.</strong> Vessel walls and perivascular regions undergo age-related structural and biochemical remodeling.</p>
+<p><strong>Age progression.</strong> Mainly 21–25m.</p>
+<p><strong>Features to compute.</strong> Vessel-wall thickness, wall-thickness CV, wall:lumen ratio, vessel protein/lipid intensity, wall heterogeneity, boundary roughness, Grad-CAM vascular overlap.</p>
+<p><strong>Strength.</strong> <span class="moderate">Moderate</span></p>
+</section>
+
+<section>
+<h3>16. Interstitial / stromal remodeling increases with advanced age</h3>
+<p><strong>Hypothesis.</strong> Advanced aging increasingly involves extratubular tissue rather than being restricted to tubular epithelium.</p>
+<p><strong>Age progression.</strong> Emerges around 21m and is most obvious at 25m.</p>
+<p><strong>Features to compute.</strong> Intertubular area fraction, interstitial protein/lipid intensity and robust CV, stromal cluster number/area, distance between tubules, extratubular signal fraction, Grad-CAM attention outside tubules.</p>
+<p><strong>Important limitation.</strong> Interstitial/stromal remodeling is defensible; fibrosis specifically needs dedicated histological or molecular validation.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<section>
+<h3>17. 21 months is a transition / remodeling state</h3>
+<p><strong>Hypothesis.</strong> Twenty-one months represents a transition between localized early aging and the widespread old phenotype observed at 25m.</p>
+<p><strong>Features to compute.</strong> Predicted-age variance/IQR, young-like and old-like fractions, old-region cluster size/connectivity, spatial autocorrelation, within-sample feature heterogeneity, possible multimodality of predicted-age distributions.</p>
+<p><strong>Strength.</strong> <span class="very-strong">Very strong</span></p>
+</section>
+
+<section>
+<h3>18. Young-like microdomains persist in old kidneys</h3>
+<p><strong>Hypothesis.</strong> Even at 25m, some regions retain morphological and biochemical characteristics associated with a younger biological state.</p>
+<p><strong>Age progression.</strong> Most evident at 25m.</p>
+<p><strong>Features to compute.</strong> Fraction of substantially younger-predicted tubules, young-island number and area, largest young component, tubule-type composition, and within-25m comparisons of brush/polarity/protein/lipid/architecture features between young-like and old-like regions.</p>
+<p><strong>Strength.</strong> <span class="strong">Strong</span></p>
+</section>
+
+<h2>Overall aging model</h2>
+
+<div class="flow">
+  <div><strong>9 months</strong><br>organized baseline</div>
+  <div class="arrow">→</div>
+  <div><strong>18 months</strong><br>focal remodeling begins</div>
+  <div class="arrow">→</div>
+  <div><strong>21 months</strong><br>heterogeneous transition state</div>
+  <div class="arrow">→</div>
+  <div><strong>25 months</strong><br>widespread degeneration with young-like islands</div>
+</div>
+
+<div class="highlight">
+  <strong>Central working model:</strong><br>
+  Loss of epithelial polarity and brush-border integrity → increasing protein/lipid heterogeneity → lumen and tubule architectural degradation → expansion and coalescence of locally aged tissue microdomains.
+</div>
+
+<h2>Recommended statistical strategy</h2>
+<p>Use two complementary analyses. <strong>Between chronological ages</strong>, test whether features change across 9m, 18m, 21m, and 25m while accounting for animal/sample identity. <strong>Within each chronological age</strong>, test why tubules from the same age—and preferably the same animal—receive different biological-age predictions.</p>
+<p>For within-age analysis, compute feature–prediction associations per animal, visualize top features across predicted-age bins, and test whether the association direction reproduces across independent animals. Mixed-effects models with animal/sample as a random effect are preferable for formal inference. Apply FDR correction and avoid treating many tubules from the same kidney as independent biological replicates.</p>
+
+</div>
+</body>
+</html>
