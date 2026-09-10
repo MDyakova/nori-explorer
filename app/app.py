@@ -216,6 +216,65 @@ def get_feature_columns(base_dir, group, task, kind, level='tubule'):
     return columns
 
 
+# Always offered as filter columns regardless of their on-disk dtype: sample_name is a
+# derived string, and class_name (the age group) is categorical even though it's often
+# stored as an int in the raw CSV.
+FEATURE_ALWAYS_TEXT_COLS = {'sample_name', 'class_name'}
+
+
+def get_feature_text_columns(base_dir, group, task, kind, level='tubule'):
+    """Subset of get_feature_columns(...) that are text/categorical — the only columns
+    that make sense to filter rows by, so this is what backs the Filter column picker."""
+    columns = get_feature_columns(base_dir, group, task, kind, level)
+    if not columns:
+        return []
+    files = list_feature_files(base_dir, group, task, kind)
+    if not files:
+        return []
+    try:
+        sample = pd.read_csv(files[0][1], nrows=500)
+    except Exception:
+        return []
+    return [
+        c for c in columns
+        if c in FEATURE_ALWAYS_TEXT_COLS or (c in sample.columns and not pd.api.types.is_numeric_dtype(sample[c]))
+    ]
+
+
+def list_feature_column_values(base_dir, group, task, kind, column):
+    """Distinct string values of `column`, read across every image's feature file of
+    `kind` (not just the first — values like file_name_save/sample_name differ per
+    image), for populating the Filter value picker."""
+    if not column:
+        return []
+    values = set()
+    for image_name, path in list_feature_files(base_dir, group, task, kind):
+        try:
+            if column == 'sample_name':
+                col_df = pd.read_csv(path, usecols=lambda c: c == 'file_name_save')
+                if 'file_name_save' not in col_df.columns:
+                    continue
+                vals = col_df['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
+            else:
+                col_df = pd.read_csv(path, usecols=lambda c: c == column)
+                if column not in col_df.columns:
+                    continue
+                vals = col_df[column]
+        except Exception:
+            continue
+        values.update(str(v) for v in vals.dropna().unique().tolist())
+    return sorted(values)
+
+
+def apply_feature_filter(df, column, values):
+    """Restrict `df` to rows where `column` (compared as text) is one of `values`.
+    No-op when no column/values are selected, or the column isn't present in `df`."""
+    if not column or not values or column not in df.columns:
+        return df
+    values_set = set(values)
+    return df[df[column].astype(str).isin(values_set)]
+
+
 def aggregate_feature_table(df, level):
     """Collapse the tubule-level table to one row per animal, or per animal x tubule
     type, matching the project's preference for animal-level statistics over raw,
@@ -297,18 +356,6 @@ def list_pred_age_trend_features(base_dir, group, task, pred_col='pred_320'):
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
     ]
 
-
-def list_tubule_types(base_dir, group, task):
-    """Distinct tubule_type values, read from just the first main feature file (the set
-    of tubule types is assumed consistent across images in a group/task)."""
-    files = list_feature_files(base_dir, group, task, 'main')
-    if not files:
-        return []
-    try:
-        values = pd.read_csv(files[0][1], usecols=['tubule_type'])['tubule_type']
-    except Exception:
-        return []
-    return sorted(values.dropna().unique().tolist())
 
 
 def load_main_shape_merged_table(base_dir, group, task):
@@ -1001,25 +1048,18 @@ def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='
     return f'data:image/png;base64,{encoded}'
 
 
-TUBULE_TYPE_ALL = '__all__'
-
-
-def build_pred_age_trend_plot(df, feature_col, pred_col='pred_320', tubule_type=TUBULE_TYPE_ALL, bin_width=0.2):
-    """Predicted-age trend for one feature, optionally restricted to one tubule type
-    (tubule_type=TUBULE_TYPE_ALL keeps every tubule type): trim outliers (IQR rule) on
-    both the prediction and the feature, bin the prediction into `bin_width`-wide
-    buckets and average within each bucket, then fit+plot a regression line and report
-    the Spearman correlation between the binned prediction and the averaged feature
-    value. Returns (image_data_uri, rho, p_value), or (None, None, None) if there isn't
-    enough data to plot."""
+def build_pred_age_trend_plot(df, feature_col, pred_col='pred_320', bin_width=0.2):
+    """Predicted-age trend for one feature: trim outliers (IQR rule) on both the
+    prediction and the feature, bin the prediction into `bin_width`-wide buckets and
+    average within each bucket, then fit+plot a regression line and report the Spearman
+    correlation between the binned prediction and the averaged feature value. Returns
+    (image_data_uri, rho, p_value), or (None, None, None) if there isn't enough data to
+    plot. Restricting to a subset (e.g. one tubule type) is the caller's job — filter
+    `df` before calling this."""
     if not {pred_col, feature_col}.issubset(df.columns):
         return None, None, None
 
     mask = (df[pred_col] >= 5) & (df[pred_col] < 28) & (df[pred_col] != -1)
-    if tubule_type and tubule_type != TUBULE_TYPE_ALL:
-        if 'tubule_type' not in df.columns:
-            return None, None, None
-        mask &= df['tubule_type'] == tubule_type
 
     a = df[mask]
     a = filter_feature_rows(a, [pred_col, feature_col])
@@ -2633,6 +2673,12 @@ def features_page_layout(base_dir, group, task):
     default_x = columns[0] if columns else None
     default_y = columns[1] if len(columns) > 1 else default_x
 
+    try:
+        filter_columns = get_feature_text_columns(base_dir, group, task, default_kind)
+    except Exception:
+        filter_columns = []
+    filter_col_options = [{'label': c, 'value': c} for c in filter_columns]
+
     def column_picker_row(prefix):
         return html.Div(className='field-row', children=[
             html.Div([
@@ -2650,11 +2696,6 @@ def features_page_layout(base_dir, group, task):
         ])
 
     pred_trend_features = list_pred_age_trend_features(base_dir, group, task)
-    tubule_types = list_tubule_types(base_dir, group, task)
-    tubule_type_options = [{'label': 'All tubules', 'value': TUBULE_TYPE_ALL}] + [
-        {'label': t, 'value': t} for t in tubule_types
-    ]
-    default_tubule_type = 'proximal' if 'proximal' in tubule_types else TUBULE_TYPE_ALL
 
     return html.Div(className='app-shell', children=[
         html.A('← Back to explorer', href='/', className='btn-outline'),
@@ -2689,6 +2730,24 @@ def features_page_layout(base_dir, group, task):
                         ],
                         value='tubule',
                         clearable=False,
+                    ),
+                ]),
+            ]),
+            html.Div(className='field-row', style={'marginTop': '14px'}, children=[
+                html.Div([
+                    html.Label('Filter column (text only)', className='field-label'),
+                    dcc.Dropdown(
+                        id='features-filter-col-dropdown',
+                        options=filter_col_options, value=None,
+                        placeholder='(no filter)',
+                    ),
+                ]),
+                html.Div([
+                    html.Label('Filter value(s)', className='field-label'),
+                    dcc.Dropdown(
+                        id='features-filter-val-dropdown',
+                        options=[], value=[], multi=True,
+                        placeholder='All values',
                     ),
                 ]),
             ]),
@@ -2763,15 +2822,6 @@ def features_page_layout(base_dir, group, task):
                         value=pred_trend_features[0] if pred_trend_features else None,
                     ),
                 ]),
-                html.Div([
-                    html.Label('Tubule type', className='field-label'),
-                    dcc.Dropdown(
-                        id='pred-trend-tubule-dropdown',
-                        options=tubule_type_options,
-                        value=default_tubule_type,
-                        clearable=False,
-                    ),
-                ]),
             ]),
             html.Button(
                 'Show plot', id='pred-trend-button', n_clicks=0,
@@ -2797,6 +2847,12 @@ def statistics_page_layout(base_dir, group, task):
 
     available_kinds = list_feature_kinds_available(base_dir, group, task)
     default_kind = available_kinds[0] if available_kinds else 'main'
+
+    try:
+        filter_columns = get_feature_text_columns(base_dir, group, task, default_kind, 'animal_median')
+    except Exception:
+        filter_columns = []
+    filter_col_options = [{'label': c, 'value': c} for c in filter_columns]
 
     return html.Div(className='app-shell', children=[
         html.A('← Back to explorer', href='/', className='btn-outline'),
@@ -2831,6 +2887,24 @@ def statistics_page_layout(base_dir, group, task):
                         ],
                         value='animal_median',
                         clearable=False,
+                    ),
+                ]),
+            ]),
+            html.Div(className='field-row', style={'marginTop': '14px'}, children=[
+                html.Div([
+                    html.Label('Filter column (text only)', className='field-label'),
+                    dcc.Dropdown(
+                        id='stats-filter-col-dropdown',
+                        options=filter_col_options, value=None,
+                        placeholder='(no filter)',
+                    ),
+                ]),
+                html.Div([
+                    html.Label('Filter value(s)', className='field-label'),
+                    dcc.Dropdown(
+                        id='stats-filter-val-dropdown',
+                        options=[], value=[], multi=True,
+                        placeholder='All values',
                     ),
                 ]),
             ]),
@@ -3348,6 +3422,42 @@ def register_callbacks(app, default_base_dir):
         return f'/statistics?{query}'
 
     @app.callback(
+        Output('stats-filter-col-dropdown', 'options'),
+        Output('stats-filter-col-dropdown', 'value'),
+        Input('stats-kind-dropdown', 'value'),
+        Input('stats-agg-dropdown', 'value'),
+        State('stats-context-store', 'data'),
+    )
+    def update_stats_filter_columns(kind, level, context):
+        if not (kind and context):
+            return [], None
+        try:
+            filter_columns = get_feature_text_columns(
+                context['base_dir'], context['group'], context['task'], kind, level or 'animal_median',
+            )
+        except Exception:
+            filter_columns = []
+        return [{'label': c, 'value': c} for c in filter_columns], None
+
+    @app.callback(
+        Output('stats-filter-val-dropdown', 'options'),
+        Output('stats-filter-val-dropdown', 'value'),
+        Input('stats-filter-col-dropdown', 'value'),
+        State('stats-kind-dropdown', 'value'),
+        State('stats-context-store', 'data'),
+    )
+    def update_stats_filter_values(column, kind, context):
+        if not (column and kind and context):
+            return [], []
+        try:
+            values = list_feature_column_values(
+                context['base_dir'], context['group'], context['task'], kind, column,
+            )
+        except Exception:
+            values = []
+        return [{'label': v, 'value': v} for v in values], []
+
+    @app.callback(
         Output('features-status', 'children'),
         Output('scatter-x-dropdown', 'options'),
         Output('scatter-y-dropdown', 'options'),
@@ -3361,12 +3471,14 @@ def register_callbacks(app, default_base_dir):
         Output('box-x-dropdown', 'value'),
         Output('box-y-dropdown', 'value'),
         Output('box-hue-dropdown', 'value'),
+        Output('features-filter-col-dropdown', 'options'),
+        Output('features-filter-col-dropdown', 'value'),
         Input('features-kind-dropdown', 'value'),
         Input('features-agg-dropdown', 'value'),
         State('features-context-store', 'data'),
     )
     def update_feature_columns(kind, level, context):
-        no_updates = (dash.no_update,) * 12
+        no_updates = (dash.no_update,) * 14
         if not (kind and context):
             return (html.Span('Select a feature file.', className='status-text'), *no_updates)
 
@@ -3374,9 +3486,14 @@ def register_callbacks(app, default_base_dir):
             columns = get_feature_columns(
                 context['base_dir'], context['group'], context['task'], kind, level or 'tubule',
             )
+            filter_columns = get_feature_text_columns(
+                context['base_dir'], context['group'], context['task'], kind, level or 'tubule',
+            )
             n_files = len(list_feature_files(context['base_dir'], context['group'], context['task'], kind))
         except Exception:
             return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
+
+        filter_col_options = [{'label': c, 'value': c} for c in filter_columns]
 
         if not columns:
             empty_hue = [{'label': '(none)', 'value': ''}]
@@ -3387,6 +3504,7 @@ def register_callbacks(app, default_base_dir):
             return (
                 status, [], [], empty_hue, [], [], empty_hue,
                 None, None, '', None, None, '',
+                filter_col_options, None,
             )
 
         column_options = [{'label': c, 'value': c} for c in columns]
@@ -3401,7 +3519,26 @@ def register_callbacks(app, default_base_dir):
             column_options, column_options, hue_options,
             default_x, default_y, '',
             default_x, default_y, '',
+            filter_col_options, None,
         )
+
+    @app.callback(
+        Output('features-filter-val-dropdown', 'options'),
+        Output('features-filter-val-dropdown', 'value'),
+        Input('features-filter-col-dropdown', 'value'),
+        State('features-kind-dropdown', 'value'),
+        State('features-context-store', 'data'),
+    )
+    def update_features_filter_values(column, kind, context):
+        if not (column and kind and context):
+            return [], []
+        try:
+            values = list_feature_column_values(
+                context['base_dir'], context['group'], context['task'], kind, column,
+            )
+        except Exception:
+            values = []
+        return [{'label': v, 'value': v} for v in values], []
 
     @app.callback(
         Output('features-scatter-status', 'children'),
@@ -3412,15 +3549,18 @@ def register_callbacks(app, default_base_dir):
         State('scatter-x-dropdown', 'value'),
         State('scatter-y-dropdown', 'value'),
         State('scatter-hue-dropdown', 'value'),
+        State('features-filter-col-dropdown', 'value'),
+        State('features-filter-val-dropdown', 'value'),
         State('features-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def update_features_scatter(n_clicks, kind, level, x_col, y_col, hue_col, context):
+    def update_features_scatter(n_clicks, kind, level, x_col, y_col, hue_col, filter_col, filter_val, context):
         if not (n_clicks and context and kind and x_col and y_col):
             return dash.no_update, dash.no_update
 
         try:
             df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            df = apply_feature_filter(df, filter_col, filter_val)
             df = aggregate_feature_table(df, level or 'tubule')
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), go.Figure()
@@ -3507,15 +3647,18 @@ def register_callbacks(app, default_base_dir):
         State('box-x-dropdown', 'value'),
         State('box-y-dropdown', 'value'),
         State('box-hue-dropdown', 'value'),
+        State('features-filter-col-dropdown', 'value'),
+        State('features-filter-val-dropdown', 'value'),
         State('features-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def update_features_box(n_clicks, kind, level, plot_type, x_col, y_col, hue_col, context):
+    def update_features_box(n_clicks, kind, level, plot_type, x_col, y_col, hue_col, filter_col, filter_val, context):
         if not (n_clicks and context and kind and x_col and y_col):
             return dash.no_update, dash.no_update
 
         try:
             df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            df = apply_feature_filter(df, filter_col, filter_val)
             df = aggregate_feature_table(df, level or 'tubule')
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), None
@@ -3532,27 +3675,28 @@ def register_callbacks(app, default_base_dir):
         Output('pred-trend-img', 'src'),
         Input('pred-trend-button', 'n_clicks'),
         State('pred-trend-feature-dropdown', 'value'),
-        State('pred-trend-tubule-dropdown', 'value'),
+        State('features-filter-col-dropdown', 'value'),
+        State('features-filter-val-dropdown', 'value'),
         State('features-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def show_pred_age_trend(n_clicks, feature, tubule_type, context):
+    def show_pred_age_trend(n_clicks, feature, filter_col, filter_val, context):
         if not (n_clicks and feature and context):
             return dash.no_update, dash.no_update
 
         try:
             df = load_main_shape_merged_table(context['base_dir'], context['group'], context['task'])
+            df = apply_feature_filter(df, filter_col, filter_val)
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), None
-            img_src, rho, p_value = build_pred_age_trend_plot(df, feature, tubule_type=tubule_type or TUBULE_TYPE_ALL)
+            img_src, rho, p_value = build_pred_age_trend_plot(df, feature)
         except Exception:
             return html.Pre(traceback.format_exc(), className='metrics-box'), None
 
         if img_src is None:
-            tubule_note = 'any tubule type' if not tubule_type or tubule_type == TUBULE_TYPE_ALL else f'{tubule_type} tubules'
             return html.Span(
-                f'Not enough data for this feature after filtering ({tubule_note}, pred_320 in '
-                '[5, 28), outliers trimmed).', className='status-error',
+                'Not enough data for this feature after filtering (pred_320 in [5, 28), outliers trimmed).',
+                className='status-error',
             ), None
 
         sig_note = 'significant' if p_value <= 0.05 else 'not significant'
@@ -3576,16 +3720,19 @@ def register_callbacks(app, default_base_dir):
         Input('stats-run-button', 'n_clicks'),
         State('stats-kind-dropdown', 'value'),
         State('stats-agg-dropdown', 'value'),
+        State('stats-filter-col-dropdown', 'value'),
+        State('stats-filter-val-dropdown', 'value'),
         State('stats-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def run_feature_stats(n_clicks, kind, level, context):
+    def run_feature_stats(n_clicks, kind, level, filter_col, filter_val, context):
         no_updates = (dash.no_update,) * 10
         if not (n_clicks and context and kind):
             return (dash.no_update, *no_updates)
 
         try:
             df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
+            df = apply_feature_filter(df, filter_col, filter_val)
             df = aggregate_feature_table(df, level or 'animal_median')
             if df.empty or 'class_name' not in df.columns:
                 status = html.Span(
@@ -3636,7 +3783,7 @@ def register_callbacks(app, default_base_dir):
             overall_ranked_src, overall_volcano_src, overall_table,
             pairwise_heatmap_src, pairwise_ranked_src, pairwise_volcano_src, pairwise_table,
             feature_options, unique_features[0] if unique_features else None,
-            {'kind': kind, 'level': level or 'animal_median'},
+            {'kind': kind, 'level': level or 'animal_median', 'filter_col': filter_col, 'filter_val': filter_val},
         )
 
     @app.callback(
@@ -3655,6 +3802,7 @@ def register_callbacks(app, default_base_dir):
 
         try:
             df = load_feature_table(context['base_dir'], context['group'], context['task'], results_meta['kind'])
+            df = apply_feature_filter(df, results_meta.get('filter_col'), results_meta.get('filter_val'))
             df = aggregate_feature_table(df, results_meta.get('level', 'animal_median'))
             img_src = build_feature_box_or_violin_plot(df, 'class_name', feature, None, plot_type or 'box')
         except Exception:

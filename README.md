@@ -70,8 +70,8 @@ for the whole-image overlay, `data/`:
   optional hue column, across every image's feature file in the task. Also has a
   "Predicted-age trend" plot: pick any numeric column from the combined main + shape
   tables (identifiers, coordinates, and the model's own prediction/attention outputs are
-  excluded) and a tubule type (all tubules, or one specific type), and see the feature's
-  trend against the model's own continuous `pred_320` prediction — outlier-trimmed (IQR)
+  excluded), and see the feature's trend against the model's own continuous `pred_320`
+  prediction — outlier-trimmed (IQR)
   on both axes, binned into 0.2-wide `pred_320` buckets and averaged, then plotted with a
   regression line and its Spearman correlation (shown for any p-value, not just
   significant ones).
