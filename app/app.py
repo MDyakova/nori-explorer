@@ -335,56 +335,64 @@ def load_feature_table(base_dir, group, task, kind):
     return df
 
 
-# Columns available for the "Predicted-age trend" plot: the main tubule table's own
-# metrics plus the shape table's morphology metrics, joined on (file_name_save,
-# contour_id == label_id), plus two ratios derived from the main table.
-def list_pred_age_trend_features(base_dir, group, task, pred_col='pred_320'):
-    """Every numeric column in the combined main+shape table (see
-    load_main_shape_merged_table), except identifiers/coordinates and the model's own
-    prediction/attention outputs — pred_col is the x-axis here, so it (and its sibling
-    pred/attn columns) aren't offered as a y-axis feature."""
-    df = load_main_shape_merged_table(base_dir, group, task)
+# The model's own prediction/attention outputs only live in the main tubule table, so
+# they're joined onto the other feature files (by file_name_save + contour_id ==
+# label_id) for the Predicted-age trend section below, letting shape/nuclei metrics be
+# plotted against predicted age too.
+PRED_TREND_MAIN_JOIN_COLS = (
+    'prediction', 'pred_320', 'pred_128',
+    'protein_attn_320', 'lipid_attn_320', 'protein_attn_128', 'lipid_attn_128',
+)
+
+
+def load_pred_trend_table(base_dir, group, task, kind):
+    """Table backing the Predicted-age trend section for the selected Feature file.
+    'main' is the main tubule table itself, with bb_size_k/lumen_size_k derived
+    (bb_size / body_size, lumen_size / body_size). Any other kind (shape, nuclei, ...)
+    is that file's own table, with PRED_TREND_MAIN_JOIN_COLS joined in from main so its
+    own metrics can still be plotted against predicted age."""
+    main_df = load_feature_table(base_dir, group, task, 'main')
+    if not main_df.empty:
+        if {'bb_size', 'body_size'}.issubset(main_df.columns):
+            main_df['bb_size_k'] = main_df['bb_size'] / main_df['body_size']
+        if {'lumen_size', 'body_size'}.issubset(main_df.columns):
+            main_df['lumen_size_k'] = main_df['lumen_size'] / main_df['body_size']
+
+    if kind in ('main', None, ''):
+        return main_df
+
+    kind_df = load_feature_table(base_dir, group, task, kind)
+    if kind_df.empty or main_df.empty:
+        return kind_df
+
+    join_cols = [c for c in PRED_TREND_MAIN_JOIN_COLS if c in main_df.columns]
+    if not join_cols or 'contour_id' not in main_df.columns or 'label_id' not in kind_df.columns:
+        return kind_df
+
+    return kind_df.merge(
+        main_df[['file_name_save', 'contour_id', *join_cols]],
+        left_on=['file_name_save', 'label_id'], right_on=['file_name_save', 'contour_id'],
+        how='left',
+    )
+
+
+# Columns available for the "Predicted-age trend" plot: every numeric column of the
+# selected Feature file's own table (see load_pred_trend_table), except
+# identifiers/coordinates and the model's own prediction/attention outputs.
+def list_pred_age_trend_features(base_dir, group, task, kind=None, pred_col='prediction'):
+    """Every numeric column in load_pred_trend_table(..., kind), except
+    identifiers/coordinates and the model's own prediction/attention outputs — pred_col
+    is the x-axis here, so it (and its sibling pred/attn columns) aren't offered as a
+    y-axis feature."""
+    df = load_pred_trend_table(base_dir, group, task, kind)
     if df.empty:
         return []
 
-    excluded = FEATURE_NON_METRIC_COLS | {
-        pred_col, 'pred_320', 'pred_128',
-        'protein_attn_320', 'lipid_attn_320', 'protein_attn_128', 'lipid_attn_128',
-    }
+    excluded = FEATURE_NON_METRIC_COLS | {pred_col, *PRED_TREND_MAIN_JOIN_COLS}
     return [
         c for c in df.columns
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
     ]
-
-
-
-def load_main_shape_merged_table(base_dir, group, task):
-    """The main tubule-level table left-joined with the shape table on
-    (file_name_save, contour_id == label_id) — the shape table has no bbox/id columns
-    of its own to look up by otherwise, but shares this id with the main table's
-    contour_id. Also derives bb_size_k and lumen_size_k (bb_size / body_size,
-    lumen_size / body_size)."""
-    main_df = load_feature_table(base_dir, group, task, 'main')
-    if main_df.empty:
-        return pd.DataFrame()
-
-    shape_df = load_feature_table(base_dir, group, task, 'shape')
-    if not shape_df.empty and 'contour_id' in main_df.columns and 'label_id' in shape_df.columns:
-        shape_only_cols = [c for c in shape_df.columns if c not in main_df.columns and c != 'label_id']
-        merged = main_df.merge(
-            shape_df[['file_name_save', 'label_id', *shape_only_cols]],
-            left_on=['file_name_save', 'contour_id'], right_on=['file_name_save', 'label_id'],
-            how='left',
-        )
-    else:
-        merged = main_df.copy()
-
-    if {'bb_size', 'body_size'}.issubset(merged.columns):
-        merged['bb_size_k'] = merged['bb_size'] / merged['body_size']
-    if {'lumen_size', 'body_size'}.issubset(merged.columns):
-        merged['lumen_size_k'] = merged['lumen_size'] / merged['body_size']
-
-    return merged
 
 
 # --- image helpers ------------------------------------------------------
@@ -1058,7 +1066,7 @@ def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='
     return f'data:image/png;base64,{encoded}'
 
 
-def build_pred_age_trend_plot(df, feature_col, pred_col='pred_320', bin_width=0.2):
+def build_pred_age_trend_plot(df, feature_col, pred_col='prediction', bin_width=0.2):
     """Predicted-age trend for one feature: trim outliers (IQR rule) on both the
     prediction and the feature, bin the prediction into `bin_width`-wide buckets and
     average within each bucket, then fit+plot a regression line and report the Spearman
@@ -1115,7 +1123,7 @@ def build_pred_age_trend_plot(df, feature_col, pred_col='pred_320', bin_width=0.
 # biological feature), and so are excluded when scanning a feature table for "does this
 # differ with age" candidates.
 FEATURE_NON_METRIC_COLS = (
-    {'class_name', 'file_name_save', 'sample_name', 'tubule_type', 'nucleolus', 'pred_320'}
+    {'class_name', 'file_name_save', 'sample_name', 'tubule_type', 'nucleolus', 'prediction', 'pred_320'}
     | FEATURE_AGG_DROPPED_COLS
 )
 
@@ -2729,7 +2737,7 @@ def features_page_layout(base_dir, group, task):
             ]),
         ])
 
-    pred_trend_features = list_pred_age_trend_features(base_dir, group, task)
+    pred_trend_features = list_pred_age_trend_features(base_dir, group, task, default_kind)
 
     return html.Div(className='app-shell', children=[
         html.Div(className='top-links-row', children=[
@@ -2853,10 +2861,11 @@ def features_page_layout(base_dir, group, task):
         html.Div(className='card', children=[
             html.Div('Predicted-age trend', className='card-title'),
             html.Div(
-                'For tubules with a valid pred_320 in [5, 28): trims outliers (IQR rule) on both pred_320 '
-                'and the feature, bins pred_320 into 0.2-wide buckets and averages within each bucket, then '
-                "plots the trend line and its Spearman correlation. Combines the main tubule table with the "
-                'shape table (joined on contour_id / label_id), so both kinds of feature are selectable here.',
+                'For tubules with a valid prediction in [5, 28): trims outliers (IQR rule) on both prediction '
+                'and the feature, bins prediction into 0.2-wide buckets and averages within each bucket, then '
+                'plots the trend line and its Spearman correlation. Uses the selected Feature file above: its '
+                'own metrics, with the prediction/attention columns (which only live in the main tubule table) '
+                'joined in when a non-main file is selected.',
                 className='status-text', style={'marginBottom': '10px'},
             ),
             html.Div(className='field-row', children=[
@@ -3519,12 +3528,14 @@ def register_callbacks(app, default_base_dir):
         Output('box-hue-dropdown', 'value'),
         Output('features-filter-col-dropdown', 'options'),
         Output('features-filter-col-dropdown', 'value'),
+        Output('pred-trend-feature-dropdown', 'options'),
+        Output('pred-trend-feature-dropdown', 'value'),
         Input('features-kind-dropdown', 'value'),
         Input('features-agg-dropdown', 'value'),
         State('features-context-store', 'data'),
     )
     def update_feature_columns(kind, level, context):
-        no_updates = (dash.no_update,) * 14
+        no_updates = (dash.no_update,) * 16
         if not (kind and context):
             return (html.Span('Select a feature file.', className='status-text'), *no_updates)
 
@@ -3535,10 +3546,15 @@ def register_callbacks(app, default_base_dir):
             filter_columns = get_feature_text_columns(
                 context['base_dir'], context['group'], context['task'], kind, level or 'tubule',
             )
+            pred_trend_features = list_pred_age_trend_features(
+                context['base_dir'], context['group'], context['task'], kind,
+            )
         except Exception:
             return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
 
         filter_col_options = [{'label': c, 'value': c} for c in filter_columns]
+        pred_trend_options = [{'label': f, 'value': f} for f in pred_trend_features]
+        pred_trend_value = pred_trend_features[0] if pred_trend_features else None
 
         if not columns:
             empty_hue = [{'label': '(none)', 'value': ''}]
@@ -3550,6 +3566,7 @@ def register_callbacks(app, default_base_dir):
                 status, [], [], empty_hue, [], [], empty_hue,
                 None, None, '', None, None, '',
                 filter_col_options, None,
+                pred_trend_options, pred_trend_value,
             )
 
         column_options = [{'label': c, 'value': c} for c in columns]
@@ -3565,6 +3582,7 @@ def register_callbacks(app, default_base_dir):
             default_x, default_y, '',
             default_x, default_y, '',
             filter_col_options, None,
+            pred_trend_options, pred_trend_value,
         )
 
     @app.callback(
@@ -3730,18 +3748,21 @@ def register_callbacks(app, default_base_dir):
         Output('pred-trend-img', 'src'),
         Input('pred-trend-button', 'n_clicks'),
         State('pred-trend-feature-dropdown', 'value'),
+        State('features-kind-dropdown', 'value'),
+        State('features-agg-dropdown', 'value'),
         State('features-filter-col-dropdown', 'value'),
         State('features-filter-val-dropdown', 'value'),
         State('features-context-store', 'data'),
         prevent_initial_call=True,
     )
-    def show_pred_age_trend(n_clicks, feature, filter_col, filter_val, context):
+    def show_pred_age_trend(n_clicks, feature, kind, level, filter_col, filter_val, context):
         if not (n_clicks and feature and context):
             return dash.no_update, dash.no_update
 
         try:
-            df = load_main_shape_merged_table(context['base_dir'], context['group'], context['task'])
+            df = load_pred_trend_table(context['base_dir'], context['group'], context['task'], kind)
             df = apply_feature_filter(df, filter_col, filter_val)
+            df = aggregate_feature_table(df, level or 'tubule')
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), None
             img_src, rho, p_value = build_pred_age_trend_plot(df, feature)
@@ -3750,7 +3771,7 @@ def register_callbacks(app, default_base_dir):
 
         if img_src is None:
             return html.Span(
-                'Not enough data for this feature after filtering (pred_320 in [5, 28), outliers trimmed).',
+                'Not enough data for this feature after filtering (prediction in [5, 28), outliers trimmed).',
                 className='status-error',
             ), None
 
