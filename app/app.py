@@ -162,8 +162,19 @@ def load_umap_df(base_dir, group, task, model_name):
     # column in that case.
     class_col = 'class_name' if 'class_name' in umap_df.columns else target_col
 
-    if pd.api.types.is_float_dtype(umap_df[class_col]):
-        umap_df[class_col] = umap_df[class_col].astype('Int64')
+    if pd.api.types.is_numeric_dtype(umap_df[class_col]) or umap_df[class_col].dtype == object:
+        # Route through pd.to_numeric + round before the Int64 cast rather than
+        # astype('Int64') directly: the source column can come in as pandas' plain
+        # float64, an object-dtype column (mixed types, stray blanks/"NA" strings from
+        # the CSV), or fractional floats, all of which make a direct astype('Int64')
+        # raise ("cannot cast ... according to the rule 'safe'") - to_numeric+round
+        # normalizes all of those into a clean, safely-castable float64 array first.
+        numeric_class = pd.to_numeric(umap_df[class_col], errors='coerce')
+        if numeric_class.notna().any():
+            try:
+                umap_df[class_col] = numeric_class.round().astype('Int64')
+            except (TypeError, ValueError):
+                pass
     umap_df['class_name'] = umap_df[class_col]
 
     class_mapping = {cls: idx for idx, cls in enumerate(umap_df['class_name'].unique())}
@@ -174,12 +185,19 @@ def load_umap_df(base_dir, group, task, model_name):
         for cls, filename in zip(umap_df['class_name'], umap_df['filename'])
     ]
 
-    # The model's actual regression target, as a plain float. It's only meaningful to
-    # snap a prediction to one of the class_name classes when the target IS the class
+    # The model's actual regression target, typed per target_name.txt's declared dtype
+    # (e.g. 'age:float', 'protein_x:float') rather than whatever pandas happened to
+    # infer from the CSV - an 'int' target is rounded to the nearest whole number,
+    # anything else (including 'float') is kept as a plain float. It's only meaningful
+    # to snap a prediction to one of the class_name classes when the target IS the class
     # column (the classic "predict age, which is also the age-group class" task) - a
     # separate continuous target such as protein expression has no natural class
     # boundaries to snap a prediction to, so pred_class is left unset for it.
-    umap_df['target_value'] = pd.to_numeric(umap_df[target_col], errors='coerce')
+    numeric_target = pd.to_numeric(umap_df[target_col], errors='coerce')
+    if target_dtype.startswith('int'):
+        umap_df['target_value'] = numeric_target.round().astype('Int64')
+    else:
+        umap_df['target_value'] = numeric_target
     if target_col == class_col:
         sorted_classes = sorted(pd.to_numeric(pd.Series(umap_df['class_name'].dropna().unique())))
         umap_df['pred_class'] = umap_df['prediction'].apply(lambda p: _nearest_class(p, sorted_classes))
