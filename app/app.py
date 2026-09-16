@@ -161,20 +161,30 @@ def load_umap_df(base_dir, group, task, model_name):
     # column because the target itself *is* the class, so fall back to the target
     # column in that case.
     class_col = 'class_name' if 'class_name' in umap_df.columns else target_col
+    has_real_class_col = class_col != target_col
 
-    if pd.api.types.is_numeric_dtype(umap_df[class_col]) or umap_df[class_col].dtype == object:
-        # Route through pd.to_numeric + round before the Int64 cast rather than
-        # astype('Int64') directly: the source column can come in as pandas' plain
-        # float64, an object-dtype column (mixed types, stray blanks/"NA" strings from
-        # the CSV), or fractional floats, all of which make a direct astype('Int64')
-        # raise ("cannot cast ... according to the rule 'safe'") - to_numeric+round
-        # normalizes all of those into a clean, safely-castable float64 array first.
-        numeric_class = pd.to_numeric(umap_df[class_col], errors='coerce')
-        if numeric_class.notna().any():
-            try:
-                umap_df[class_col] = numeric_class.round().astype('Int64')
-            except (TypeError, ValueError):
-                pass
+    # Rounding class_col to a clean Int64 (so heatmap folder names read "9" rather than
+    # "9.0") only makes sense when class_col is a genuine discrete grouping: either a
+    # real class_name column (has_real_class_col), or the legacy 'age' task where age
+    # itself doubles as the class. If class_col fell back to a continuous, non-age
+    # target with no class_name column (e.g. a protein-expression target with no
+    # separate grouping column in this CSV), rounding would destroy its precision even
+    # though target_name.txt declares it float - so leave it untouched in that case.
+    if has_real_class_col or target_col == 'age':
+        if pd.api.types.is_numeric_dtype(umap_df[class_col]) or umap_df[class_col].dtype == object:
+            # Route through pd.to_numeric + round before the Int64 cast rather than
+            # astype('Int64') directly: the source column can come in as pandas' plain
+            # float64, an object-dtype column (mixed types, stray blanks/"NA" strings
+            # from the CSV), or fractional floats, all of which make a direct
+            # astype('Int64') raise ("cannot cast ... according to the rule 'safe'") -
+            # to_numeric+round normalizes all of those into a clean, safely-castable
+            # float64 array first.
+            numeric_class = pd.to_numeric(umap_df[class_col], errors='coerce')
+            if numeric_class.notna().any():
+                try:
+                    umap_df[class_col] = numeric_class.round().astype('Int64')
+                except (TypeError, ValueError):
+                    pass
     umap_df['class_name'] = umap_df[class_col]
 
     class_mapping = {cls: idx for idx, cls in enumerate(umap_df['class_name'].unique())}
