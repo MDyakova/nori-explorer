@@ -190,9 +190,19 @@ def load_umap_df(base_dir, group, task, model_name):
     class_mapping = {cls: idx for idx, cls in enumerate(umap_df['class_name'].unique())}
     umap_df['class_numeric'] = umap_df['class_name'].map(class_mapping)
 
+    # folder_name is the exact on-disk heatmap subfolder for each row
+    # (heatmaps/<model>/<folder_name>/<filename>). When the umap CSV has a dedicated
+    # folder_name column, use it verbatim - it's already the correct folder name, so no
+    # rounding/reformatting (unlike class_name, which can legitimately be a raw
+    # continuous target value and would otherwise produce a folder like
+    # "4.659999847412109"). Falls back to class_name for older CSVs without a
+    # folder_name column.
+    folder_col = 'folder_name' if 'folder_name' in umap_df.columns else class_col
+    umap_df['folder_name'] = umap_df[folder_col]
+
     umap_df['heatmap_path'] = [
-        os.path.join('outputs', group, task, 'heatmaps', model_name, str(cls), filename)
-        for cls, filename in zip(umap_df['class_name'], umap_df['filename'])
+        os.path.join('outputs', group, task, 'heatmaps', model_name, str(folder), filename)
+        for folder, filename in zip(umap_df['folder_name'], umap_df['filename'])
     ]
 
     # The model's actual regression target, typed per target_name.txt's declared dtype
@@ -1802,8 +1812,18 @@ def resolve_whole_image_path(base_dir, group, image_name):
 
 ORIGINAL_OVERLAY_FIG_WIDTH = 30
 ORIGINAL_OVERLAY_FIG_HEIGHT = 10
-OVERLAY_PRED_VMIN = 8
-OVERLAY_PRED_VMAX = 26
+
+
+def overlay_pred_range(base_dir, group, task, model_name):
+    """Colorbar min/max for the whole-image prediction overlay: the min/max of the
+    'prediction' column across the model's whole umap.csv (not just the one image being
+    viewed), so the color scale reflects the model's actual prediction range for this
+    task rather than a fixed range tied to any one target's scale (e.g. age in
+    months)."""
+    predictions = load_umap_df(base_dir, group, task, model_name)['prediction'].dropna()
+    if predictions.empty:
+        return 0.0, 1.0
+    return float(predictions.min()), float(predictions.max())
 
 
 def build_whole_image_overlay(
@@ -1817,6 +1837,7 @@ def build_whole_image_overlay(
             f'(looked in each class subfolder for a name containing "_<class>").'
         )
 
+    pred_vmin, pred_vmax = overlay_pred_range(base_dir, group, task, model_name)
     max_p, max_l = load_max_values(base_dir, group, task)
     umap_df_im = add_tile_xy(get_tiles_for_image(base_dir, group, task, model_name, image_name))
 
@@ -1858,7 +1879,7 @@ def build_whole_image_overlay(
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.imshow(gray_image, cmap='gray')
-    ax.imshow(pred_overlay, cmap='jet', alpha=0.45, vmin=OVERLAY_PRED_VMIN, vmax=OVERLAY_PRED_VMAX)
+    ax.imshow(pred_overlay, cmap='jet', alpha=0.45, vmin=pred_vmin, vmax=pred_vmax)
     ax.axis('off')
 
     # No title/padding baked in: the saved PNG's content must line up pixel-for-pixel
@@ -1869,7 +1890,7 @@ def build_whole_image_overlay(
     fig.savefig(buf, format='png', dpi=90, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
-    return f'data:image/png;base64,{encoded}', tif_path, tile_size
+    return f'data:image/png;base64,{encoded}', tif_path, tile_size, pred_vmin, pred_vmax
 
 
 def find_tiles_at_fraction(base_dir, group, task, model_name, image_name, frac_x, frac_y):
@@ -1900,7 +1921,7 @@ def find_tiles_at_fraction(base_dir, group, task, model_name, image_name, frac_x
     ].sort_values(['y', 'x'])
 
     return [
-        {'filename': row['filename'], 'class_name': row['class_name'], 'x': int(row['x']), 'y': int(row['y'])}
+        {'filename': row['filename'], 'folder_name': row['folder_name'], 'x': int(row['x']), 'y': int(row['y'])}
         for _, row in matches.iterrows()
     ]
 
@@ -1911,7 +1932,7 @@ def collect_tile_heatmaps(base_dir, group, task, model_name, tiles):
     heatmaps = []
     for tile in tiles:
         rel_path = os.path.join(
-            'outputs', group, task, 'heatmaps', model_name, str(tile['class_name']), tile['filename'],
+            'outputs', group, task, 'heatmaps', model_name, str(tile['folder_name']), tile['filename'],
         )
         if os.path.isfile(os.path.join(base_dir, rel_path)):
             heatmaps.append({
@@ -1920,14 +1941,14 @@ def collect_tile_heatmaps(base_dir, group, task, model_name, tiles):
     return heatmaps
 
 
-def build_overlay_colorbar():
+def build_overlay_colorbar(vmin, vmax):
     """Standalone 'Prediction' colorbar for the whole-image overlay, matching the jet
     colormap/range used to render the overlay itself — rendered as its own image next
     to the main overlay image, rather than baked into it, so the zoom pixel coordinates
     on that image stay untouched (matches how build_channel_colorbars works for the
     Image viewer)."""
     fig, ax = plt.subplots(figsize=(0.7, 1.75), constrained_layout=True)
-    norm = matplotlib.colors.Normalize(vmin=OVERLAY_PRED_VMIN, vmax=OVERLAY_PRED_VMAX)
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
     cbar = fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap='jet'), cax=ax)
     cbar.set_label('Prediction', fontsize=8)
     cbar.ax.tick_params(labelsize=6)
@@ -4058,7 +4079,7 @@ def register_callbacks(app, default_base_dir):
         cleared_heatmaps = {'items': [], 'index': 0}
 
         try:
-            img_src, tif_path, tile_size = build_whole_image_overlay(
+            img_src, tif_path, tile_size, pred_vmin, pred_vmax = build_whole_image_overlay(
                 context['base_dir'], context['group'], context['task'], context['model'], image_name,
             )
         except Exception:
@@ -4070,7 +4091,7 @@ def register_callbacks(app, default_base_dir):
         status = html.Span(
             f'Loaded: {tif_path}  ·  Tile size: {tile_size}px (auto-detected)', className='status-ok',
         )
-        colorbar_img = build_overlay_colorbar()
+        colorbar_img = build_overlay_colorbar(pred_vmin, pred_vmax)
         return (
             status, img_src, pil_to_data_uri(colorbar_img),
             cleared_heatmaps, TILE_HEATMAP_IDLE_STATUS,
