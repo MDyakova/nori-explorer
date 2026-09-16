@@ -101,23 +101,90 @@ def list_models(base_dir, group, task):
     return sorted(f.replace('.csv', '') for f in os.listdir(model_dir))
 
 
+TARGET_NAME_FILENAME = 'target_name.txt'
+
+
+def target_name_txt_path(base_dir, group, task):
+    return os.path.join(base_dir, 'outputs', group, task, TARGET_NAME_FILENAME)
+
+
+def load_target_info(base_dir, group, task):
+    """Read outputs/<group>/<task>/target_name.txt - one line, 'name:dtype' (e.g.
+    'age:float', or a protein-expression column such as 'clathrin_hc:float') -
+    identifying which umap.csv column is this model's regression target. Falls back to
+    ('age', 'float'), the original hardcoded target, when the file is missing or
+    unparsable so older output folders keep working unchanged."""
+    path = target_name_txt_path(base_dir, group, task)
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8-sig') as f:
+            line = f.readline().strip()
+        if ':' in line:
+            name, dtype = line.split(':', 1)
+            name = name.strip()
+            if name:
+                return name, dtype.strip().lower()
+    return 'age', 'float'
+
+
+def target_label(umap_df):
+    """Human-readable label for the model's regression target, derived from the name in
+    target_name.txt (e.g. 'age' -> 'Age', 'protein_x' -> 'Protein X')."""
+    col = (umap_df.attrs.get('target_col') or 'target').replace('_', ' ').strip()
+    return col.title() if col else 'Target'
+
+
+def _nearest_class(value, sorted_classes):
+    """Snap `value` to the closest entry in `sorted_classes` using the midpoints
+    between consecutive classes as boundaries - a class-count-agnostic replacement for a
+    hardcoded threshold list."""
+    if value is None or pd.isna(value) or not sorted_classes:
+        return None
+    idx = 0
+    for i in range(len(sorted_classes) - 1):
+        midpoint = (sorted_classes[i] + sorted_classes[i + 1]) / 2
+        if value < midpoint:
+            break
+        idx = i + 1
+    return sorted_classes[idx]
+
+
 def load_umap_df(base_dir, group, task, model_name):
     umap_df = pd.read_csv(os.path.join(base_dir, 'outputs', group, task, 'umap', f'{model_name}.csv'))
 
-    if pd.api.types.is_float_dtype(umap_df['age']):
-        umap_df['age'] = umap_df['age'].astype('Int64')
+    target_col, target_dtype = load_target_info(base_dir, group, task)
+    umap_df.attrs['target_col'] = target_col
+    umap_df.attrs['target_dtype'] = target_dtype
 
-    class_mapping = {cls: idx for idx, cls in enumerate(umap_df['age'].unique())}
-    umap_df['class_numeric'] = umap_df['age'].map(class_mapping)
+    # class_name is the discrete grouping column heatmaps are filed under (outputs/.../
+    # heatmaps/<model>/<class_name>/...). Older umap.csv files (single-target 'age'
+    # tasks, from before target_name.txt existed) don't carry a separate class_name
+    # column because the target itself *is* the class, so fall back to the target
+    # column in that case.
+    class_col = 'class_name' if 'class_name' in umap_df.columns else target_col
+
+    if pd.api.types.is_float_dtype(umap_df[class_col]):
+        umap_df[class_col] = umap_df[class_col].astype('Int64')
+    umap_df['class_name'] = umap_df[class_col]
+
+    class_mapping = {cls: idx for idx, cls in enumerate(umap_df['class_name'].unique())}
+    umap_df['class_numeric'] = umap_df['class_name'].map(class_mapping)
 
     umap_df['heatmap_path'] = [
-        os.path.join('outputs', group, task, 'heatmaps', model_name, str(age), filename)
-        for age, filename in zip(umap_df['age'], umap_df['filename'])
+        os.path.join('outputs', group, task, 'heatmaps', model_name, str(cls), filename)
+        for cls, filename in zip(umap_df['class_name'], umap_df['filename'])
     ]
 
-    umap_df['pred_class'] = umap_df['prediction'].apply(
-        lambda p: 9 if p < 15 else 18 if p < 19.5 else 21 if p < 23 else 25
-    )
+    # The model's actual regression target, as a plain float. It's only meaningful to
+    # snap a prediction to one of the class_name classes when the target IS the class
+    # column (the classic "predict age, which is also the age-group class" task) - a
+    # separate continuous target such as protein expression has no natural class
+    # boundaries to snap a prediction to, so pred_class is left unset for it.
+    umap_df['target_value'] = pd.to_numeric(umap_df[target_col], errors='coerce')
+    if target_col == class_col:
+        sorted_classes = sorted(pd.to_numeric(pd.Series(umap_df['class_name'].dropna().unique())))
+        umap_df['pred_class'] = umap_df['prediction'].apply(lambda p: _nearest_class(p, sorted_classes))
+    else:
+        umap_df['pred_class'] = None
     return umap_df
 
 
@@ -161,8 +228,8 @@ def find_channel_index(channel_names, target_name, fallback_idx):
 def compute_metrics(base_dir, umap_df, group, task):
     max_p, max_l = load_max_values(base_dir, group, task)
 
-    mae = mean_absolute_error(umap_df['age'], umap_df['prediction'])
-    r2 = r2_score(umap_df['age'], umap_df['prediction'])
+    mae = mean_absolute_error(umap_df['target_value'], umap_df['prediction'])
+    r2 = r2_score(umap_df['target_value'], umap_df['prediction'])
     return mae, r2, max_p, max_l
 
 
@@ -445,22 +512,23 @@ def table_with_toolbar(table, filename):
 def build_attention_boxplots(umap_df):
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    order = sorted(umap_df['age'].dropna().unique())
+    order = sorted(umap_df['class_name'].dropna().unique())
+    label = target_label(umap_df)
 
     sns.boxplot(
-        data=umap_df, x='age', y='protein_attn', hue='age', order=order, hue_order=order,
+        data=umap_df, x='class_name', y='protein_attn', hue='class_name', order=order, hue_order=order,
         palette='viridis', dodge=False, legend=False, ax=axes[0],
     )
-    axes[0].set_title('Protein attention by aging group')
-    axes[0].set_xlabel('Age')
+    axes[0].set_title(f'Protein attention by {label.lower()}')
+    axes[0].set_xlabel(label)
     axes[0].grid(True)
 
     sns.boxplot(
-        data=umap_df, x='age', y='lipid_attn', hue='age', order=order, hue_order=order,
+        data=umap_df, x='class_name', y='lipid_attn', hue='class_name', order=order, hue_order=order,
         palette='viridis', dodge=False, legend=False, ax=axes[1],
     )
-    axes[1].set_title('Lipid attention by aging group')
-    axes[1].set_xlabel('Age')
+    axes[1].set_title(f'Lipid attention by {label.lower()}')
+    axes[1].set_xlabel(label)
     axes[1].grid(True)
 
     fig.tight_layout()
@@ -474,16 +542,16 @@ def build_attention_boxplots(umap_df):
 def build_static_umap_image(umap_df, model_name):
     fig, ax = plt.subplots(figsize=(5, 4.2))
 
-    order = sorted(umap_df['age'].dropna().unique())
+    order = sorted(umap_df['class_name'].dropna().unique())
     sns.scatterplot(
-        data=umap_df, x='umap1', y='umap2', hue='age', hue_order=order,
+        data=umap_df, x='umap1', y='umap2', hue='class_name', hue_order=order,
         palette='viridis', s=14, linewidth=0, ax=ax,
     )
     ax.set_title(model_name, fontsize=11)
     ax.set_xlabel('UMAP1')
     ax.set_ylabel('UMAP2')
     ax.grid(alpha=0.3)
-    ax.legend(title='Age', fontsize=8, title_fontsize=8, markerscale=1.2, loc='best')
+    ax.legend(title=target_label(umap_df), fontsize=8, title_fontsize=8, markerscale=1.2, loc='best')
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -496,15 +564,18 @@ def build_static_umap_image(umap_df, model_name):
 def build_static_umap_kde_image(umap_df, model_name):
     fig, ax = plt.subplots(figsize=(5, 4.2))
 
-    order = sorted(umap_df['age'].dropna().unique())
+    order = sorted(umap_df['class_name'].dropna().unique())
     sns.kdeplot(
-        data=umap_df, x='umap1', y='umap2', hue='age', hue_order=order,
+        data=umap_df, x='umap1', y='umap2', hue='class_name', hue_order=order,
         palette='viridis', fill=False, common_norm=True, ax=ax,
     )
     ax.set_title(f'{model_name} (density)', fontsize=11)
     ax.set_xlabel('UMAP1')
     ax.set_ylabel('UMAP2')
     ax.grid(alpha=0.3)
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.set_title(target_label(umap_df))
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -526,9 +597,9 @@ def build_static_umap_prediction_image(umap_df, model_name):
 
     sm = matplotlib.cm.ScalarMappable(cmap='viridis', norm=norm)
     sm.set_array([])
-    fig.colorbar(sm, ax=ax, label='Predicted age')
+    fig.colorbar(sm, ax=ax, label=f'Predicted {target_label(umap_df)}')
 
-    ax.set_title(f'{model_name} (predicted age)', fontsize=11)
+    ax.set_title(f'{model_name} (predicted {target_label(umap_df).lower()})', fontsize=11)
     ax.set_xlabel('UMAP1')
     ax.set_ylabel('UMAP2')
     ax.grid(alpha=0.3)
@@ -551,22 +622,24 @@ def build_combined_prediction_boxplot(base_dir, group, task, model_names):
     if not frames:
         return None
 
+    target_lbl = target_label(frames[0])
     combined_df = pd.concat(frames, ignore_index=True)
-    combined_df = combined_df.dropna(subset=['age']).sort_values(by='age', key=lambda s: s.astype(int))
-    age_order = combined_df['age'].astype(int).drop_duplicates().astype(str).tolist()
-    combined_df['age'] = combined_df['age'].astype(str)
+    combined_df = combined_df.dropna(subset=['class_name']).sort_values(by='class_name', key=lambda s: s.astype(int))
+    class_order = combined_df['class_name'].astype(int).drop_duplicates().astype(str).tolist()
+    combined_df['class_name'] = combined_df['class_name'].astype(str)
 
     n_samples = combined_df['sample_name'].nunique()
     fig, ax = plt.subplots(figsize=(max(9, n_samples * 0.5), 6))
 
     sns.boxplot(
-        data=combined_df, x='sample_name', y='prediction', hue='age', hue_order=age_order,
+        data=combined_df, x='sample_name', y='prediction', hue='class_name', hue_order=class_order,
         showfliers=False, ax=ax,
     )
+    ax.legend(title=target_lbl)
 
     ax.set_xlabel('Sample')
     ax.set_ylabel('Prediction')
-    ax.set_title('Predictions by age and sample (all models combined)')
+    ax.set_title(f'Predictions by {target_lbl.lower()} and sample (all models combined)')
     ax.tick_params(axis='x', rotation=45)
     for label in ax.get_xticklabels():
         label.set_ha('right')
@@ -596,10 +669,10 @@ def overlap_coefficient(x1, x2, n_points=512):
     return float(np.trapz(np.minimum(kde1(grid), kde2(grid)), grid))
 
 
-def tile_overlap_by_animal(df, animal_col='sample_name', age_col='age', pred_col='prediction', age_pairs=None):
-    """Pairwise tile-distribution overlap between every animal at age1 and every animal at age2.
+def tile_overlap_by_animal(df, animal_col='sample_name', age_col='class_name', pred_col='prediction', age_pairs=None):
+    """Pairwise tile-distribution overlap between every animal at class1 and every animal at class2.
 
-    age_pairs defaults to consecutive age transitions found in df, rather than a
+    age_pairs defaults to consecutive class_name transitions found in df, rather than a
     hardcoded kidney-aging schedule, so this generalizes across groups/tasks.
     """
     if age_pairs is None:
@@ -628,7 +701,7 @@ def tile_overlap_by_animal(df, animal_col='sample_name', age_col='age', pred_col
                     continue
 
                 results.append({
-                    'comparison': f'{age1}m vs {age2}m',
+                    'comparison': f'{age1} vs {age2}',
                     'young_animal': animal1,
                     'old_animal': animal2,
                     'n_young_tiles': len(x1),
@@ -672,17 +745,18 @@ def build_animal_level_separation_plot(base_dir, group, task, model_names):
     if not frames:
         return None
 
+    target_lbl = target_label(frames[0])
     combined_df = pd.concat(frames, ignore_index=True)
-    combined_df = combined_df.dropna(subset=['age', 'sample_name', 'prediction'])
+    combined_df = combined_df.dropna(subset=['class_name', 'sample_name', 'prediction'])
     if combined_df.empty:
         return None
-    combined_df['age'] = combined_df['age'].astype(int)
+    combined_df['class_name'] = combined_df['class_name'].astype(int)
 
-    ages = sorted(combined_df['age'].unique())
+    ages = sorted(combined_df['class_name'].unique())
     age_pairs = list(zip(ages[:-1], ages[1:]))
     if not age_pairs:
         return None
-    comparison_order = [f'{age1}m vs {age2}m' for age1, age2 in age_pairs]
+    comparison_order = [f'{age1} vs {age2}' for age1, age2 in age_pairs]
 
     tile_animal_pairs = tile_overlap_by_animal(combined_df, age_pairs=age_pairs)
     if tile_animal_pairs.empty:
@@ -719,10 +793,10 @@ def build_animal_level_separation_plot(base_dir, group, task, model_names):
     )
 
     ax.set_xticks(x)
-    ax.set_xticklabels([c.replace(' vs ', ' → ').replace('m', '') for c in tile_ci_df['comparison']])
-    ax.set_xlabel('Age transition (months)')
+    ax.set_xticklabels([c.replace(' vs ', ' → ') for c in tile_ci_df['comparison']])
+    ax.set_xlabel(f'{target_lbl} transition')
     ax.set_ylabel('Distribution separation (1 − OVL)')
-    ax.set_title('Animal-level prediction distribution separation by age transition')
+    ax.set_title(f'Animal-level prediction distribution separation by {target_lbl.lower()} transition')
     ax.set_ylim(0, 1)
     ax.grid(axis='y', alpha=0.25)
     ax.legend()
@@ -736,10 +810,11 @@ def build_animal_level_separation_plot(base_dir, group, task, model_names):
 
 
 def build_animal_median_age_trend_plot(base_dir, group, task, model_names):
-    """Median predicted vs. actual age, computed from one median-prediction value per
-    animal per model (not pooled tiles), so each animal contributes equally regardless
-    of tile count. A single overall median line is drawn across all animals/models, with
-    the underlying per-animal points colored by model so model-level spread is visible."""
+    """Median predicted vs. actual target value, computed from one median-prediction
+    value per animal per model (not pooled tiles), so each animal contributes equally
+    regardless of tile count. A single overall median line is drawn across all
+    animals/models, with the underlying per-animal points colored by model so
+    model-level spread is visible."""
     frames = []
     for model_name in model_names:
         try:
@@ -754,42 +829,41 @@ def build_animal_median_age_trend_plot(base_dir, group, task, model_names):
         return None
 
     combined_df = pd.concat(frames, ignore_index=True)
-    combined_df = combined_df.dropna(subset=['age', 'sample_name', 'prediction'])
+    combined_df = combined_df.dropna(subset=['target_value', 'sample_name', 'prediction'])
     if combined_df.empty:
         return None
-    combined_df['age'] = combined_df['age'].astype(int)
 
     animal_medians = (
         combined_df
-        .groupby(['sample_name', 'age', 'model_name'], as_index=False)['prediction']
+        .groupby(['sample_name', 'model_name'], as_index=False)[['target_value', 'prediction']]
         .median()
     )
 
-    age_ticks = sorted(animal_medians['age'].unique())
-    age_min, age_max = age_ticks[0], age_ticks[-1]
+    val_min = min(animal_medians['target_value'].min(), animal_medians['prediction'].min())
+    val_max = max(animal_medians['target_value'].max(), animal_medians['prediction'].max())
+    label = target_label(frames[0])
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
     sns.lineplot(
-        data=animal_medians, x='age', y='prediction',
+        data=animal_medians, x='target_value', y='prediction',
         estimator='median', errorbar=None, linewidth=1.5, color='#444444',
         marker=None, ax=ax, label='Median (all animals)', zorder=1,
     )
 
     sns.scatterplot(
-        data=animal_medians, x='age', y='prediction', hue='model_name',
+        data=animal_medians, x='target_value', y='prediction', hue='model_name',
         s=40, linewidth=0, ax=ax, zorder=2,
     )
 
     ax.plot(
-        [age_min, age_max], [age_min, age_max], '--', linewidth=2, color='black',
-        label='Ideal prediction (age = age)', zorder=1,
+        [val_min, val_max], [val_min, val_max], '--', linewidth=2, color='black',
+        label=f'Ideal prediction ({label.lower()} = {label.lower()})', zorder=1,
     )
 
-    ax.set_xlabel('Age (months)')
-    ax.set_ylabel('Predicted age (months)')
-    ax.set_xticks(age_ticks)
-    ax.set_title('Median predicted age by animal (dots colored by model)')
+    ax.set_xlabel(label)
+    ax.set_ylabel(f'Predicted {label}')
+    ax.set_title(f'Median predicted {label.lower()} by animal (dots colored by model)')
     ax.grid(alpha=0.3)
     ax.legend(title='Model', bbox_to_anchor=(1.02, 0.5), loc='center left', fontsize=8, title_fontsize=8)
     fig.tight_layout()
@@ -1066,20 +1140,20 @@ def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='
     return f'data:image/png;base64,{encoded}'
 
 
-def build_pred_age_trend_plot(df, feature_col, pred_col='prediction', bin_width=0.2):
-    """Predicted-age trend for one feature: trim outliers (IQR rule) on both the
+def build_pred_age_trend_plot(df, feature_col, pred_col='prediction', bin_width=None, target_label='Target'):
+    """Predicted-target trend for one feature: trim outliers (IQR rule) on both the
     prediction and the feature, bin the prediction into `bin_width`-wide buckets and
     average within each bucket, then fit+plot a regression line and report the Spearman
     correlation between the binned prediction and the averaged feature value. Returns
     (image_data_uri, rho, p_value), or (None, None, None) if there isn't enough data to
     plot. Restricting to a subset (e.g. one tubule type) is the caller's job — filter
-    `df` before calling this."""
+    `df` before calling this. `bin_width` defaults to a size derived from the (outlier-
+    trimmed) prediction range, so this works whether the target's native scale is small
+    (age in months) or large (a raw protein-expression value)."""
     if not {pred_col, feature_col}.issubset(df.columns):
         return None, None, None
 
-    mask = (df[pred_col] >= 5) & (df[pred_col] < 28) & (df[pred_col] != -1)
-
-    a = df[mask]
+    a = df[df[pred_col] != -1]
     a = filter_feature_rows(a, [pred_col, feature_col])
     if len(a) < 4:
         return None, None, None
@@ -1091,6 +1165,10 @@ def build_pred_age_trend_plot(df, feature_col, pred_col='prediction', bin_width=
     a = a[(a[feature_col] >= lower_c) & (a[feature_col] <= upper_c)]
     if len(a) < 4:
         return None, None, None
+
+    if bin_width is None:
+        pred_range = a[pred_col].max() - a[pred_col].min()
+        bin_width = pred_range / 30 if pred_range > 0 else 1.0
 
     binned = a[[pred_col, feature_col]].copy()
     binned[pred_col] = (binned[pred_col] // bin_width) * bin_width
@@ -1106,7 +1184,7 @@ def build_pred_age_trend_plot(df, feature_col, pred_col='prediction', bin_width=
         scatter_kws={'s': 15}, line_kws={'color': 'red'}, ax=ax,
     )
     ax.set_title(f'{feature_col}\nSpearman R={rho:.3f}, p={p_value:.3g}')
-    ax.set_xlabel('Predicted age')
+    ax.set_xlabel(f'Predicted {target_label}')
     ax.grid(True)
     fig.tight_layout()
 
@@ -1217,7 +1295,7 @@ def fit_mixed_effects_age(df, age_col, feature_col, group_col='sample_name'):
         return np.nan, np.nan, 'failed to fit'
 
 
-def compute_overall_feature_stats(df, age_col='class_name'):
+def compute_overall_feature_stats(df, age_col='class_name', label='target'):
     """For every numeric feature column, run the full suite of "does this differ across
     ALL ages" tests: Kruskal-Wallis (non-parametric omnibus), Welch's ANOVA (parametric,
     robust to unequal variance), Spearman's rho and a simple linear regression (is there
@@ -1296,7 +1374,7 @@ def compute_overall_feature_stats(df, age_col='class_name'):
     result['abs_spearman_rho'] = result['spearman_rho'].abs()
     result['direction'] = np.select(
         [result['spearman_rho'] > 0, result['spearman_rho'] < 0],
-        ['increases with age', 'decreases with age'],
+        [f'increases with {label}', f'decreases with {label}'],
         default='n/a',
     )
     result['transition'] = None
@@ -1306,7 +1384,7 @@ def compute_overall_feature_stats(df, age_col='class_name'):
     return result
 
 
-def compute_pairwise_feature_stats(df, age_col='class_name'):
+def compute_pairwise_feature_stats(df, age_col='class_name', label='target'):
     """For every numeric feature column and every pair of adjacent age groups: Welch's
     t-test (parametric) and Mann-Whitney U (non-parametric) as a matched pair of
     significance tests, plus Cohen's d and Cliff's delta as their matching
@@ -1350,7 +1428,7 @@ def compute_pairwise_feature_stats(df, age_col='class_name'):
             if np.isnan(d):
                 direction = 'n/a'
             else:
-                direction = 'increases with age' if d < 0 else 'decreases with age'
+                direction = f'increases with {label}' if d < 0 else f'decreases with {label}'
 
             rows.append({
                 'feature': col,
@@ -1379,14 +1457,16 @@ def compute_pairwise_feature_stats(df, age_col='class_name'):
 
 def build_stats_ranked_bar_plot(
     results_df, q_col='q_value', direction_col='direction',
-    transition_col='transition', title_suffix='features differing across ages', top_n=20,
+    transition_col='transition', title_suffix=None, top_n=20, label='target',
 ):
     if results_df.empty:
         return None
 
+    title_suffix = title_suffix or f'features differing with {label}'
+
     top = results_df.head(top_n).iloc[::-1]
     neglog_q = -np.log10(top[q_col].clip(lower=1e-300))
-    colors = ['#dc2626' if d == 'decreases with age' else '#2563eb' for d in top[direction_col]]
+    colors = ['#dc2626' if d == f'decreases with {label}' else '#2563eb' for d in top[direction_col]]
     if transition_col and transition_col in top.columns:
         labels = [f'{f} ({t})' if t else f for f, t in zip(top['feature'], top[transition_col])]
     else:
@@ -1398,8 +1478,8 @@ def build_stats_ranked_bar_plot(
     ax.set_xlabel('-log10(q-value)')
     ax.set_title(f'Top {len(top)} {title_suffix}')
     ax.legend(handles=[
-        matplotlib.patches.Patch(color='#2563eb', label='increases with age'),
-        matplotlib.patches.Patch(color='#dc2626', label='decreases with age'),
+        matplotlib.patches.Patch(color='#2563eb', label=f'increases with {label}'),
+        matplotlib.patches.Patch(color='#dc2626', label=f'decreases with {label}'),
     ], loc='lower right', fontsize=8)
     ax.grid(axis='x', alpha=0.3)
     fig.tight_layout()
@@ -1413,10 +1493,11 @@ def build_stats_ranked_bar_plot(
 
 def build_stats_volcano_plot(
     results_df, q_col='q_value', effect_col='max_abs_cohens_d', transition_col='transition',
-    xlabel="Effect size (|Cohen's d|)", title='Feature significance vs. effect size (age differences)',
+    xlabel="Effect size (|Cohen's d|)", title=None, label='target',
 ):
     if results_df.empty:
         return None
+    title = title or f'Feature significance vs. effect size ({label} differences)'
 
     x = results_df[effect_col]
     y = -np.log10(results_df[q_col].clip(lower=1e-300))
@@ -1457,7 +1538,7 @@ def _transition_start_age(transition):
         return float('inf')
 
 
-def build_pairwise_effect_size_heatmap(results_df, top_n=50):
+def build_pairwise_effect_size_heatmap(results_df, top_n=50, label='target'):
     """Rows = features, columns = age transitions, cells = signed Cohen's d — the
     single view the ranked bar/volcano plots can't give you, since those only surface
     each feature's single strongest transition. Here every feature-by-transition effect
@@ -1508,8 +1589,8 @@ def build_pairwise_effect_size_heatmap(results_df, top_n=50):
                 color='white' if abs(value) > max_abs * 0.6 else 'black',
             )
 
-    fig.colorbar(im, ax=ax, shrink=0.8, label="Cohen's d  (+ decreases with age, − increases with age)")
-    ax.set_title(f'Age-transition effect-size heatmap (top {len(top_features)} features by q-value)')
+    fig.colorbar(im, ax=ax, shrink=0.8, label=f"Cohen's d  (+ decreases with {label}, − increases with {label})")
+    ax.set_title(f'{label.title()}-transition effect-size heatmap (top {len(top_features)} features by q-value)')
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -1527,7 +1608,7 @@ def _fmt_stat(value, spec='.3g'):
     return f'{value:{spec}}'
 
 
-def build_overall_stats_table(results_df, max_rows=100):
+def build_overall_stats_table(results_df, max_rows=100, label='target'):
     """Kruskal-Wallis, Welch's ANOVA, Spearman's rho, linear regression, and the
     mixed-effects model — one row per feature."""
     if results_df.empty:
@@ -1539,7 +1620,7 @@ def build_overall_stats_table(results_df, max_rows=100):
         "Welch's ANOVA F", 'Welch p', 'Welch q',
         'Spearman ρ', 'Spearman p', 'Spearman q',
         'Linear slope', 'Linear r', 'Linear p', 'Linear q',
-        'Mixed-model coef (age)', 'Mixed p', 'Mixed q', 'Mixed note',
+        f'Mixed-model coef ({label})', 'Mixed p', 'Mixed q', 'Mixed note',
         'Direction',
     ]])
     body_rows = []
@@ -1791,7 +1872,7 @@ def find_tiles_at_fraction(base_dir, group, task, model_name, image_name, frac_x
     ].sort_values(['y', 'x'])
 
     return [
-        {'filename': row['filename'], 'age': row['age'], 'x': int(row['x']), 'y': int(row['y'])}
+        {'filename': row['filename'], 'class_name': row['class_name'], 'x': int(row['x']), 'y': int(row['y'])}
         for _, row in matches.iterrows()
     ]
 
@@ -1802,7 +1883,7 @@ def collect_tile_heatmaps(base_dir, group, task, model_name, tiles):
     heatmaps = []
     for tile in tiles:
         rel_path = os.path.join(
-            'outputs', group, task, 'heatmaps', model_name, str(tile['age']), tile['filename'],
+            'outputs', group, task, 'heatmaps', model_name, str(tile['class_name']), tile['filename'],
         )
         if os.path.isfile(os.path.join(base_dir, rel_path)):
             heatmaps.append({
@@ -2194,9 +2275,9 @@ def build_umap_figure(umap_df, group, task, model_name):
             y=umap_df['umap2'],
             mode='markers',
             marker=dict(size=8, color=umap_df['class_numeric'], colorscale='Viridis'),
-            customdata=umap_df[['age', 'filename', 'heatmap_path']].values,
+            customdata=umap_df[['class_name', 'filename', 'heatmap_path']].values,
             hovertemplate=(
-                'Age: %{customdata[0]}<br>'
+                f'{target_label(umap_df)}: %{{customdata[0]}}<br>'
                 'Coordinates: (%{x:.2f}, %{y:.2f})<br>'
                 'Image Name: %{customdata[1]}<extra></extra>'
             ),
@@ -2620,6 +2701,9 @@ def all_umaps_page_layout(base_dir, group, task):
 
     combined_section = []
     if model_names:
+        _target_col, _ = load_target_info(base_dir, group, task)
+        _target_lbl = _target_col.replace('_', ' ').strip().title() or 'Target'
+
         try:
             combined_src = build_combined_prediction_boxplot(base_dir, group, task, model_names)
         except Exception:
@@ -2629,9 +2713,9 @@ def all_umaps_page_layout(base_dir, group, task):
             combined_error = None
 
         combined_section.append(html.Div(className='card', children=[
-            html.Div('Predictions by age and sample (all models combined)', className='card-title'),
+            html.Div(f'Predictions by {_target_lbl.lower()} and sample (all models combined)', className='card-title'),
             plot_with_toolbar(
-                html.Img(src=combined_src, className='umap-card-img umap-card-img-75'), 'predictions_by_age_and_sample',
+                html.Img(src=combined_src, className='umap-card-img umap-card-img-75'), 'predictions_by_target_and_sample',
             ) if combined_src
             else html.Pre(combined_error or 'No data available.', className='metrics-box'),
         ]))
@@ -2645,7 +2729,7 @@ def all_umaps_page_layout(base_dir, group, task):
             animal_level_error = None
 
         combined_section.append(html.Div(className='card', children=[
-            html.Div('Animal-level distribution separation by age transition', className='card-title'),
+            html.Div(f'Animal-level distribution separation by {_target_lbl.lower()} transition', className='card-title'),
             plot_with_toolbar(
                 html.Img(src=animal_level_src, className='umap-card-img umap-card-img-75'), 'animal_level_separation',
             ) if animal_level_src
@@ -2661,9 +2745,9 @@ def all_umaps_page_layout(base_dir, group, task):
             age_trend_error = None
 
         combined_section.append(html.Div(className='card', children=[
-            html.Div('Median predicted age by animal (dots colored by model)', className='card-title'),
+            html.Div(f'Median predicted {_target_lbl.lower()} by animal (dots colored by model)', className='card-title'),
             plot_with_toolbar(
-                html.Img(src=age_trend_src, className='umap-card-img umap-card-img-75'), 'median_predicted_age_by_animal',
+                html.Img(src=age_trend_src, className='umap-card-img umap-card-img-75'), 'median_predicted_target_by_animal',
             ) if age_trend_src
             else html.Pre(age_trend_error or 'No data available.', className='metrics-box'),
         ]))
@@ -2705,6 +2789,9 @@ def features_page_layout(base_dir, group, task):
     feat_dir = features_dir_path(base_dir, group, task)
     available_kinds = list_feature_kinds_available(base_dir, group, task)
     default_kind = available_kinds[0] if available_kinds else 'main'
+
+    _target_col, _ = load_target_info(base_dir, group, task)
+    _label = _target_col.replace('_', ' ').strip().title() or 'Target'
 
     try:
         columns = get_feature_columns(base_dir, group, task, default_kind)
@@ -2859,13 +2946,13 @@ def features_page_layout(base_dir, group, task):
         ]),
 
         html.Div(className='card', children=[
-            html.Div('Predicted-age trend', className='card-title'),
+            html.Div(f'Predicted-{_label} trend', className='card-title'),
             html.Div(
-                'For tubules with a valid prediction in [5, 28): trims outliers (IQR rule) on both prediction '
-                'and the feature, bins prediction into 0.2-wide buckets and averages within each bucket, then '
-                'plots the trend line and its Spearman correlation. Uses the selected Feature file above: its '
-                'own metrics, with the prediction/attention columns (which only live in the main tubule table) '
-                'joined in when a non-main file is selected.',
+                'For tubules with a valid prediction: trims outliers (IQR rule) on both prediction and the '
+                'feature, bins prediction into buckets (sized automatically from the trimmed prediction range) '
+                'and averages within each bucket, then plots the trend line and its Spearman correlation. Uses '
+                'the selected Feature file above: its own metrics, with the prediction/attention columns '
+                '(which only live in the main tubule table) joined in when a non-main file is selected.',
                 className='status-text', style={'marginBottom': '10px'},
             ),
             html.Div(className='field-row', children=[
@@ -2902,6 +2989,9 @@ def statistics_page_layout(base_dir, group, task):
 
     available_kinds = list_feature_kinds_available(base_dir, group, task)
     default_kind = available_kinds[0] if available_kinds else 'main'
+
+    _target_col, _ = load_target_info(base_dir, group, task)
+    _label = (_target_col.replace('_', ' ').strip().title() or 'Target').lower()
 
     try:
         filter_columns = get_feature_text_columns(base_dir, group, task, default_kind, 'animal_median')
@@ -2965,11 +3055,11 @@ def statistics_page_layout(base_dir, group, task):
             ]),
             html.Div(
                 f'Runs every test below for every numeric feature: Kruskal-Wallis and Welch\'s ANOVA (does '
-                f'the feature differ across all age groups at once, parametrically and non-parametrically), '
-                f'Spearman\'s ρ and a linear regression (is there a monotonic/linear trend with age), and a '
-                f'random-intercept mixed-effects model (feature ~ age, animal as random effect — uses every '
+                f'the feature differ across all {_label} classes at once, parametrically and non-parametrically), '
+                f'Spearman\'s ρ and a linear regression (is there a monotonic/linear trend with {_label}), and a '
+                f'random-intercept mixed-effects model (feature ~ {_label}, animal as random effect — uses every '
                 f'tubule while still accounting for which animal it came from). For each pair of adjacent '
-                f'age groups: Welch\'s t-test and Mann-Whitney U (pairwise significance), Cohen\'s d and '
+                f'{_label} classes: Welch\'s t-test and Mann-Whitney U (pairwise significance), Cohen\'s d and '
                 f"Cliff's delta (matching effect sizes). Each test's p-values get their own "
                 f'Benjamini-Hochberg FDR q-value across every feature tested. Animal-level aggregation is '
                 f'recommended over raw tubules to avoid pseudoreplication (thousands of correlated tubules '
@@ -2986,12 +3076,12 @@ def statistics_page_layout(base_dir, group, task):
         ]),
 
         html.Div(className='app-header', children=[
-            html.H3('Differences across all ages'),
+            html.H3(f'Differences across all {_label} classes'),
             html.P('Kruskal-Wallis, Welch\'s ANOVA, Spearman\'s ρ, linear regression, mixed-effects model.'),
         ]),
 
         html.Div(className='card', children=[
-            html.Div('Ranked features (overall age effect)', className='card-title'),
+            html.Div(f'Ranked features (overall {_label} effect)', className='card-title'),
             plot_with_toolbar(
                 html.Img(id='stats-overall-ranked-img', className='umap-card-img umap-card-img-75'),
                 'stats_overall_ranked_features',
@@ -3012,16 +3102,16 @@ def statistics_page_layout(base_dir, group, task):
         ]),
 
         html.Div(className='app-header', children=[
-            html.H3('Differences between age groups'),
-            html.P("Welch's t-test, Mann-Whitney U, Cohen's d, Cliff's delta — one row per adjacent age transition."),
+            html.H3(f'Differences between {_label} classes'),
+            html.P(f"Welch's t-test, Mann-Whitney U, Cohen's d, Cliff's delta — one row per adjacent {_label} transition."),
         ]),
 
         html.Div(className='card', children=[
-            html.Div('Age-transition effect-size heatmap', className='card-title'),
+            html.Div(f'{_label.title()}-transition effect-size heatmap', className='card-title'),
             html.Div(
-                "Rows = features, columns = age transitions, color/value = Cohen's d — see at a glance which "
+                f"Rows = features, columns = {_label} transitions, color/value = Cohen's d — see at a glance which "
                 'features move most, in which direction, and whether the change is concentrated in one '
-                'transition or spread across the whole age range.',
+                f'transition or spread across the whole {_label} range.',
                 className='status-text', style={'marginBottom': '10px'},
             ),
             plot_with_toolbar(
@@ -3031,7 +3121,7 @@ def statistics_page_layout(base_dir, group, task):
         ]),
 
         html.Div(className='card', children=[
-            html.Div('Ranked features (pairwise age transitions)', className='card-title'),
+            html.Div(f'Ranked features (pairwise {_label} transitions)', className='card-title'),
             plot_with_toolbar(
                 html.Img(id='stats-pairwise-ranked-img', className='umap-card-img umap-card-img-75'),
                 'stats_pairwise_ranked_features',
@@ -3765,13 +3855,15 @@ def register_callbacks(app, default_base_dir):
             df = aggregate_feature_table(df, level or 'tubule')
             if df.empty:
                 return html.Span('No feature data found.', className='status-error'), None
-            img_src, rho, p_value = build_pred_age_trend_plot(df, feature)
+            target_col, _ = load_target_info(context['base_dir'], context['group'], context['task'])
+            label = target_col.replace('_', ' ').strip().title() or 'Target'
+            img_src, rho, p_value = build_pred_age_trend_plot(df, feature, target_label=label)
         except Exception:
             return html.Pre(traceback.format_exc(), className='metrics-box'), None
 
         if img_src is None:
             return html.Span(
-                'Not enough data for this feature after filtering (prediction in [5, 28), outliers trimmed).',
+                'Not enough data for this feature after filtering (outliers trimmed).',
                 className='status-error',
             ), None
 
@@ -3807,41 +3899,45 @@ def register_callbacks(app, default_base_dir):
             return (dash.no_update, *no_updates)
 
         try:
+            target_col, _ = load_target_info(context['base_dir'], context['group'], context['task'])
+            label = target_col.replace('_', ' ').strip().title() or 'Target'
+
             df = load_feature_table(context['base_dir'], context['group'], context['task'], kind)
             df = apply_feature_filter(df, filter_col, filter_val)
             df = aggregate_feature_table(df, level or 'animal_median')
             if df.empty or 'class_name' not in df.columns:
                 status = html.Span(
-                    'No feature data (or no class_name/age column) found for this selection.',
+                    'No feature data (or no class_name column) found for this selection.',
                     className='status-error',
                 )
                 return (status, *no_updates)
-            overall = compute_overall_feature_stats(df, age_col='class_name')
-            pairwise = compute_pairwise_feature_stats(df, age_col='class_name')
+            overall = compute_overall_feature_stats(df, age_col='class_name', label=label.lower())
+            pairwise = compute_pairwise_feature_stats(df, age_col='class_name', label=label.lower())
         except Exception:
             return (html.Pre(traceback.format_exc(), className='metrics-box'), *no_updates)
 
         if overall.empty and pairwise.empty:
             status = html.Span(
-                'No numeric features could be tested (need at least 2 age groups with data).',
+                'No numeric features could be tested (need at least 2 classes with data).',
                 className='status-error',
             )
             return (status, *no_updates)
 
         overall_ranked_src = build_stats_ranked_bar_plot(
-            overall, title_suffix='features by overall age effect',
+            overall, title_suffix=f'features by overall {label.lower()} effect', label=label.lower(),
         )
         overall_volcano_src = build_stats_volcano_plot(
             overall, effect_col='abs_spearman_rho', transition_col=None,
-            xlabel="Effect size (|Spearman ρ|)", title='Overall age effect: significance vs. trend strength',
+            xlabel="Effect size (|Spearman ρ|)", title=f'Overall {label.lower()} effect: significance vs. trend strength',
+            label=label.lower(),
         )
-        overall_table = build_overall_stats_table(overall)
+        overall_table = build_overall_stats_table(overall, label=label.lower())
 
-        pairwise_heatmap_src = build_pairwise_effect_size_heatmap(pairwise)
+        pairwise_heatmap_src = build_pairwise_effect_size_heatmap(pairwise, label=label.lower())
         pairwise_ranked_src = build_stats_ranked_bar_plot(
-            pairwise, title_suffix='features by pairwise age-transition difference',
+            pairwise, title_suffix=f'features by pairwise {label.lower()}-transition difference', label=label.lower(),
         )
-        pairwise_volcano_src = build_stats_volcano_plot(pairwise)
+        pairwise_volcano_src = build_stats_volcano_plot(pairwise, label=label.lower())
         pairwise_table = build_pairwise_stats_table(pairwise)
 
         unique_features = list(dict.fromkeys([*overall['feature'], *pairwise['feature']]))
@@ -4290,7 +4386,7 @@ def register_callbacks(app, default_base_dir):
         if not click_data or not store_data or not base_dir:
             return html.Div('Click a point in the UMAP plot to inspect a tile.', className='tile-placeholder')
 
-        age, image_name, heatmap_path = click_data['points'][0]['customdata']
+        class_name, image_name, heatmap_path = click_data['points'][0]['customdata']
 
         record = next((r for r in store_data['records'] if r['filename'] == image_name), None)
         prediction = record['prediction'] if record else None
@@ -4302,14 +4398,19 @@ def register_callbacks(app, default_base_dir):
             return html.Div(f'Could not load heatmap image: {exc}', className='status-error')
 
         prediction_text = round(prediction, 2) if prediction is not None else '?'
+        target_col, _ = load_target_info(base_dir, context['group'], context['task'])
+        target_lbl = (target_col.replace('_', ' ').strip().title() or 'Target')
+
+        meta_children = [
+            html.Strong(f'{target_lbl}: '), f'{class_name}   ',
+            html.Strong('Prediction: '), f'{prediction_text}   ',
+        ]
+        if pred_class is not None:
+            meta_children += [html.Strong('Predicted class: '), f'{pred_class}']
 
         return html.Div([
             html.P([html.Strong('Image: '), image_name], className='tile-meta'),
-            html.P([
-                html.Strong('Age: '), f'{age}   ',
-                html.Strong('Prediction: '), f'{prediction_text}   ',
-                html.Strong('Predicted class: '), f'{pred_class}',
-            ], className='tile-meta'),
+            html.P(meta_children, className='tile-meta'),
             plot_with_toolbar(
                 html.Img(src=pil_to_data_uri(heatmap_image), className='tile-image'),
                 os.path.splitext(image_name)[0] + '_heatmap',
