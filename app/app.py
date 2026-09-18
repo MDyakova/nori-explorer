@@ -20,6 +20,7 @@ import webbrowser
 from urllib.parse import parse_qs, urlencode
 
 import dash
+import flask
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.cm
@@ -198,6 +199,30 @@ def _nearest_class(value, sorted_classes):
     return sorted_classes[idx]
 
 
+def round_class_name(series):
+    """Round a class_name/grouping column to 2 decimals (np.round(x, 2)) before it's
+    used as a plot hue/legend/filter category anywhere. class_name is NOT always a
+    whole-number bucket - a genuine discrete class (e.g. an age-in-months group) is,
+    but class_name can also fall back to a continuous target (e.g. a protein-expression
+    value like 1.3500000023841858) standing in for it, where real fractional classes
+    (3.26 vs 3.38) must stay distinct. np.round(x, 2) handles both: it cleans up
+    ordinary floating-point noise either way, without collapsing genuinely different
+    classes into the same bucket the way rounding to the nearest integer would."""
+    return np.round(pd.to_numeric(series, errors='coerce'), 2) + 0.0  # +0.0 turns -0.0 into 0.0
+
+
+def format_class_name(value):
+    """Clean display string for one (already round_class_name-rounded) class_name
+    value: a whole number shows as e.g. '9' rather than '9.0'; a fractional value keeps
+    up to 2 decimals with no trailing zeros, e.g. '1.35' or '3.3' (not '3.30')."""
+    if pd.isna(value):
+        return ''
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return f'{value:.2f}'.rstrip('0').rstrip('.')
+
+
 def load_umap_df(base_dir, group, task, model_name):
     umap_df = pd.read_csv(os.path.join(base_dir, 'outputs', group, task, 'umap', f'{model_name}.csv'))
 
@@ -218,8 +243,9 @@ def load_umap_df(base_dir, group, task, model_name):
     # real class_name column (has_real_class_col), or the legacy 'age' task where age
     # itself doubles as the class. If class_col fell back to a continuous, non-age
     # target with no class_name column (e.g. a protein-expression target with no
-    # separate grouping column in this CSV), rounding would destroy its precision even
-    # though target_name.txt declares it float - so leave it untouched in that case.
+    # separate grouping column in this CSV), rounding it here would break the
+    # folder-path resolution below - the on-disk folder is the raw target string (e.g.
+    # "4.659999847412109") in that case - so leave it untouched.
     if has_real_class_col or target_col == 'age':
         if pd.api.types.is_numeric_dtype(umap_df[class_col]) or umap_df[class_col].dtype == object:
             # Route through pd.to_numeric + round before the Int64 cast rather than
@@ -235,18 +261,24 @@ def load_umap_df(base_dir, group, task, model_name):
                     umap_df[class_col] = numeric_class.round().astype('Int64')
                 except (TypeError, ValueError):
                     pass
-    umap_df['class_name'] = umap_df[class_col]
+
+    # class_name (used for plot hue/legend/grouping/filtering everywhere else) is always
+    # rounded to 2 decimals - see round_class_name - on top of whatever class_col above
+    # ended up as (an Int64 bucket, or still a raw continuous value kept for folder-path
+    # purposes). This cleans up ordinary floating-point noise either way (e.g. a raw
+    # 1.3500000023841858) without collapsing genuinely distinct classes (e.g. 3.26 vs
+    # 3.38) the way rounding to the nearest whole number would.
+    umap_df['class_name'] = round_class_name(umap_df[class_col])
 
     class_mapping = {cls: idx for idx, cls in enumerate(umap_df['class_name'].unique())}
     umap_df['class_numeric'] = umap_df['class_name'].map(class_mapping)
 
     # folder_name is the exact on-disk heatmap subfolder for each row
     # (heatmaps/<model>/<folder_name>/<filename>). When the umap CSV has a dedicated
-    # folder_name column, use it verbatim - it's already the correct folder name, so no
-    # rounding/reformatting (unlike class_name, which can legitimately be a raw
-    # continuous target value and would otherwise produce a folder like
-    # "4.659999847412109"). Falls back to class_name for older CSVs without a
-    # folder_name column.
+    # folder_name column, use it verbatim - it's already the correct folder name.
+    # Falls back to class_col (not the rounded class_name above) for older CSVs without
+    # a folder_name column, since class_col may still carry the raw continuous-target
+    # precision the actual on-disk folder name needs.
     folder_col = 'folder_name' if 'folder_name' in umap_df.columns else class_col
     umap_df['folder_name'] = umap_df[folder_col]
 
@@ -366,6 +398,21 @@ def features_dir_path(base_dir, group, task):
     return os.path.join(base_dir, 'outputs', group, task, 'features')
 
 
+NORI_PROTEIN_EXPLORER_FILENAME = 'nori_protein_explorer.html'
+
+
+def nori_protein_explorer_path(base_dir, group, task):
+    """Path to outputs/<group>/<task>/features/nori_protein_explorer.html, or None if the
+    file is missing or group/task point outside <base_dir>/outputs."""
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
+        return None
+    outputs_root = os.path.realpath(os.path.join(base_dir, 'outputs'))
+    path = os.path.realpath(os.path.join(features_dir_path(base_dir, group, task), NORI_PROTEIN_EXPLORER_FILENAME))
+    if os.path.commonpath([outputs_root, path]) != outputs_root or not os.path.isfile(path):
+        return None
+    return path
+
+
 def feature_file_path(base_dir, group, task, kind):
     return os.path.join(features_dir_path(base_dir, group, task), _FEATURE_FILENAMES[kind])
 
@@ -439,6 +486,13 @@ def list_feature_column_values(base_dir, group, task, kind, column):
             if column not in col_df.columns:
                 return []
             vals = col_df[column]
+            # class_name must be normalized exactly the way load_feature_table
+            # normalizes it (round_class_name), or these option strings (e.g. the raw
+            # "1.3500000023841858") would never match the filtered dataframe's actual
+            # values (e.g. "1.35"), silently returning no rows.
+            if column == 'class_name':
+                vals = round_class_name(vals)
+                return sorted((format_class_name(v) for v in vals.dropna().unique()), key=float)
     except Exception:
         return []
     return sorted(str(v) for v in vals.dropna().unique().tolist())
@@ -501,9 +555,9 @@ def load_feature_table(base_dir, group, task, kind):
         df['sample_name'] = df['file_name_save'].astype(str).apply(lambda p: p.split('_MAP')[0])
 
     if 'class_name' in df.columns:
-        df['class_name'] = df['class_name'].astype(int)
+        df['class_name'] = round_class_name(df['class_name'])
         df.sort_values(by=['class_name'], inplace=True)
-        df['class_name'] = df['class_name'].astype(str)
+        df['class_name'] = df['class_name'].apply(format_class_name)
 
     return df
 
@@ -618,20 +672,22 @@ def table_with_toolbar(table, filename):
 def build_attention_boxplots(umap_df):
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    order = sorted(umap_df['class_name'].dropna().unique())
+    order = sorted(umap_df['class_name'].dropna().unique().tolist(), key=float)
+    order_labels = [format_class_name(v) for v in order]
     label = target_label(umap_df)
+    plot_df = umap_df.assign(class_name=umap_df['class_name'].apply(format_class_name))
 
     sns.boxplot(
-        data=umap_df, x='class_name', y='protein_attn', hue='class_name', order=order, hue_order=order,
-        palette='viridis', dodge=False, legend=False, ax=axes[0],
+        data=plot_df, x='class_name', y='protein_attn', hue='class_name', order=order_labels,
+        hue_order=order_labels, palette='viridis', dodge=False, legend=False, ax=axes[0],
     )
     axes[0].set_title(f'Protein attention by {label.lower()}')
     axes[0].set_xlabel(label)
     axes[0].grid(True)
 
     sns.boxplot(
-        data=umap_df, x='class_name', y='lipid_attn', hue='class_name', order=order, hue_order=order,
-        palette='viridis', dodge=False, legend=False, ax=axes[1],
+        data=plot_df, x='class_name', y='lipid_attn', hue='class_name', order=order_labels,
+        hue_order=order_labels, palette='viridis', dodge=False, legend=False, ax=axes[1],
     )
     axes[1].set_title(f'Lipid attention by {label.lower()}')
     axes[1].set_xlabel(label)
@@ -648,20 +704,25 @@ def build_attention_boxplots(umap_df):
 def build_static_umap_image(umap_df, model_name):
     fig, ax = plt.subplots(figsize=(5, 4.2))
 
-    order = sorted(umap_df['class_name'].dropna().unique())
+    order = sorted(umap_df['class_name'].dropna().unique().tolist(), key=float)
+    order_labels = [format_class_name(v) for v in order]
+    plot_df = umap_df.assign(class_name=umap_df['class_name'].apply(format_class_name))
     sns.scatterplot(
-        data=umap_df, x='umap1', y='umap2', hue='class_name', hue_order=order,
+        data=plot_df, x='umap1', y='umap2', hue='class_name', hue_order=order_labels,
         palette='viridis', s=14, linewidth=0, ax=ax,
     )
     ax.set_title(model_name, fontsize=11)
     ax.set_xlabel('UMAP1')
     ax.set_ylabel('UMAP2')
     ax.grid(alpha=0.3)
-    ax.legend(title=target_label(umap_df), fontsize=8, title_fontsize=8, markerscale=1.2, loc='best')
+    ax.legend(
+        title=target_label(umap_df), fontsize=8, title_fontsize=8, markerscale=1.2,
+        bbox_to_anchor=(1.02, 0.5), loc='center left',
+    )
 
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110)
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -670,22 +731,23 @@ def build_static_umap_image(umap_df, model_name):
 def build_static_umap_kde_image(umap_df, model_name):
     fig, ax = plt.subplots(figsize=(5, 4.2))
 
-    order = sorted(umap_df['class_name'].dropna().unique())
+    order = sorted(umap_df['class_name'].dropna().unique().tolist(), key=float)
+    order_labels = [format_class_name(v) for v in order]
+    plot_df = umap_df.assign(class_name=umap_df['class_name'].apply(format_class_name))
     sns.kdeplot(
-        data=umap_df, x='umap1', y='umap2', hue='class_name', hue_order=order,
+        data=plot_df, x='umap1', y='umap2', hue='class_name', hue_order=order_labels,
         palette='viridis', fill=False, common_norm=True, ax=ax,
     )
     ax.set_title(f'{model_name} (density)', fontsize=11)
     ax.set_xlabel('UMAP1')
     ax.set_ylabel('UMAP2')
     ax.grid(alpha=0.3)
-    legend = ax.get_legend()
-    if legend is not None:
-        legend.set_title(target_label(umap_df))
+    if ax.get_legend() is not None:
+        sns.move_legend(ax, 'center left', bbox_to_anchor=(1.02, 0.5), title=target_label(umap_df))
 
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110)
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -730,9 +792,23 @@ def build_combined_prediction_boxplot(base_dir, group, task, model_names):
 
     target_lbl = target_label(frames[0])
     combined_df = pd.concat(frames, ignore_index=True)
-    combined_df = combined_df.dropna(subset=['class_name']).sort_values(by='class_name', key=lambda s: s.astype(int))
-    class_order = combined_df['class_name'].astype(int).drop_duplicates().astype(str).tolist()
-    combined_df['class_name'] = combined_df['class_name'].astype(str)
+    combined_df = combined_df.dropna(subset=['class_name'])
+    # Build class_order and combined_df['class_name'] from the exact same
+    # round_class_name + format_class_name conversion - if they used different
+    # conversions (e.g. one keeping the raw "1.3500000023841858" while the other
+    # normalized to "1.35"), hue_order wouldn't match any actual row, seaborn's per-hue
+    # grouping would find nothing for every level, and it crashes with an
+    # UnboundLocalError instead of drawing an empty plot.
+    combined_df['class_name'] = round_class_name(combined_df['class_name'])
+    combined_df = combined_df.sort_values(by='class_name')
+    class_order = [format_class_name(v) for v in combined_df['class_name'].drop_duplicates()]
+    combined_df['class_name'] = combined_df['class_name'].apply(format_class_name)
+
+    # Nothing plottable (e.g. every row is missing sample_name/prediction) - bail out
+    # here rather than handing seaborn an empty boxplot, which raises a confusing
+    # UnboundLocalError deep in its legend-building code instead of an empty plot.
+    if combined_df[['sample_name', 'prediction', 'class_name']].dropna().empty:
+        return None
 
     n_samples = combined_df['sample_name'].nunique()
     fig, ax = plt.subplots(figsize=(max(9, n_samples * 0.5), 6))
@@ -741,7 +817,7 @@ def build_combined_prediction_boxplot(base_dir, group, task, model_names):
         data=combined_df, x='sample_name', y='prediction', hue='class_name', hue_order=class_order,
         showfliers=False, ax=ax,
     )
-    ax.legend(title=target_lbl)
+    ax.legend(title=target_lbl, bbox_to_anchor=(1.02, 0.5), loc='center left')
 
     ax.set_xlabel('Sample')
     ax.set_ylabel('Prediction')
@@ -807,7 +883,7 @@ def tile_overlap_by_animal(df, animal_col='sample_name', age_col='class_name', p
                     continue
 
                 results.append({
-                    'comparison': f'{age1} vs {age2}',
+                    'comparison': f'{format_class_name(age1)} vs {format_class_name(age2)}',
                     'young_animal': animal1,
                     'old_animal': animal2,
                     'n_young_tiles': len(x1),
@@ -856,13 +932,13 @@ def build_animal_level_separation_plot(base_dir, group, task, model_names):
     combined_df = combined_df.dropna(subset=['class_name', 'sample_name', 'prediction'])
     if combined_df.empty:
         return None
-    combined_df['class_name'] = combined_df['class_name'].astype(int)
+    combined_df['class_name'] = round_class_name(combined_df['class_name'])
 
     ages = sorted(combined_df['class_name'].unique())
     age_pairs = list(zip(ages[:-1], ages[1:]))
     if not age_pairs:
         return None
-    comparison_order = [f'{age1} vs {age2}' for age1, age2 in age_pairs]
+    comparison_order = [f'{format_class_name(age1)} vs {format_class_name(age2)}' for age1, age2 in age_pairs]
 
     tile_animal_pairs = tile_overlap_by_animal(combined_df, age_pairs=age_pairs)
     if tile_animal_pairs.empty:
@@ -905,7 +981,7 @@ def build_animal_level_separation_plot(base_dir, group, task, model_names):
     ax.set_title(f'Animal-level prediction distribution separation by {target_lbl.lower()} transition')
     ax.set_ylim(0, 1)
     ax.grid(axis='y', alpha=0.25)
-    ax.legend()
+    ax.legend(bbox_to_anchor=(1.02, 0.5), loc='center left')
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -1586,7 +1662,7 @@ def build_stats_ranked_bar_plot(
     ax.legend(handles=[
         matplotlib.patches.Patch(color='#2563eb', label=f'increases with {label}'),
         matplotlib.patches.Patch(color='#dc2626', label=f'decreases with {label}'),
-    ], loc='lower right', fontsize=8)
+    ], bbox_to_anchor=(1.02, 0.5), loc='center left', fontsize=8)
     ax.grid(axis='x', alpha=0.3)
     fig.tight_layout()
 
@@ -1627,7 +1703,7 @@ def build_stats_volcano_plot(
     ax.set_ylabel('-log10(q-value)')
     ax.set_title(title)
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=8, bbox_to_anchor=(1.02, 0.5), loc='center left')
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -2685,6 +2761,15 @@ def main_page_layout(default_base_dir):
                     ),
                 ]),
             ]),
+            html.Div(className='btn-group', children=[
+                html.Div('NORI + Proteomics', className='btn-group-label'),
+                html.Div(className='btn-secondary', style={'display': 'flex', 'gap': '10px'}, children=[
+                    html.A(
+                        'NORI + Proteomics explorer', id='nori-protein-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                ]),
+            ]),
         ]),
 
         html.Div(className='card', children=[
@@ -2692,13 +2777,12 @@ def main_page_layout(default_base_dir):
             html.P([
                 'Each model in this tool is a multimodal neural network that predicts the biological '
                 'age (in months) of a kidney tissue tile from complementary views of the same tubule: '
-                'a protein image, a lipid image, and a fluorescent marker image, plus an ',
-                html.Strong('optional'), ' mass-spectrometry/proteomics (MS) spectrum when it\'s '
-                'available for a sample. Combining modalities gives a more complete, less ambiguous '
-                'picture of aging than any single one alone — protein alone, lipid alone, or marker '
-                'alone is easy to confuse across ages, but together they reduce uncertainty and '
-                'improve prediction; MS adds unbiased molecular composition on top when present, but '
-                "the model doesn't require it to run.",
+                'a protein image, a lipid image, and an ',
+                html.Strong('optional'), ' fluorescent marker image when it\'s available for a '
+                'sample. Combining modalities gives a more complete, less ambiguous picture of '
+                'aging than any single one alone — protein alone, lipid alone, or marker alone is '
+                'easy to confuse across ages, but together they reduce uncertainty and improve '
+                "prediction; the model doesn't require the marker image to run.",
             ], className='model-info-intro'),
             html.Div(className='model-info-grid', children=[
                 html.Div(className='model-info-item', children=[
@@ -2711,27 +2795,22 @@ def main_page_layout(default_base_dir):
                     html.P('Shows lipid accumulation, droplet formation, and changes in cellular '
                            'metabolism.'),
                 ]),
-                html.Div(className='model-info-item', children=[
-                    html.H5('Fluorescent marker (activity)'),
-                    html.P('Highlights molecular pathways, cell states, proliferation, and injury '
-                           'response.'),
-                ]),
                 html.Div(className='model-info-item model-info-item-optional', children=[
                     html.Div(className='model-info-item-header', children=[
-                        html.H5('Mass spectrometry (composition)'),
+                        html.H5('Fluorescent marker (activity)'),
                         html.Span('Optional', className='model-info-optional-badge'),
                     ]),
-                    html.P('Unbiased molecular composition — proteins, peptides, lipids — as a 1D '
-                           "spectrum per sample/tile, used when it's available. The model still runs "
-                           'on the three imaging modalities alone when it\'s not.'),
+                    html.P('Highlights molecular pathways, cell states, proliferation, and injury '
+                           "response, used when it's available. The model still runs on the protein "
+                           "and lipid images alone when it's not."),
                 ]),
             ]),
             html.P([
                 html.Strong('How the modalities are combined: '),
-                'each image modality is encoded by its own ResNet50 (pretrained on ImageNet) and the '
-                'MS spectrum by a small MLP, producing a 128-dimensional embedding per modality. A '
+                'each image modality is encoded by its own ResNet50 (pretrained on ImageNet), '
+                'producing a 128-dimensional embedding per modality. A '
                 'transformer-style multi-head attention layer — with a learnable "CLS" summary token '
-                '— then fuses the four embeddings, letting the model learn how much to trust each '
+                '— then fuses the embeddings, letting the model learn how much to trust each '
                 'modality for a given tile rather than forcing them all to matter equally. This is '
                 'what the "Attention scores by aging group" chart on the UMAP explorer page shows: '
                 'which modality the model leaned on most, by age group.',
@@ -2748,9 +2827,8 @@ def main_page_layout(default_base_dir):
             html.Details(className='model-info-details', children=[
                 html.Summary('More detail: training and why fusion beats stacking channels'),
                 html.P([
-                    html.Strong('Why not just stack the four images as channels? '),
-                    'Stacking forces very different signal types (structure, metabolism, activity, '
-                    'composition) into the same pixels, with incompatible intensity scales — the '
+                    html.Strong('Why not just stack the images as channels? '),
+                    'Stacking forces very different signal types (structure, metabolism, activity) into the same pixels, with incompatible intensity scales — the '
                     'model has to disentangle that from scratch, which hurts both accuracy and '
                     'generalization to new batches/datasets. Keeping each modality separate and '
                     'fusing them with attention lets the model learn per-modality importance and '
@@ -2758,7 +2836,7 @@ def main_page_layout(default_base_dir):
                 ], className='model-info-step'),
                 html.P([
                     html.Strong('Training: '),
-                    'each whole-slide sample is split into many overlapping tiles (e.g. 256×256 px); '
+                    'each whole-slide sample is split into many overlapping tiles (e.g. 320×320 px); '
                     'the model is trained per tile via k-fold cross-validation, grouped so that all '
                     'tiles from one animal/sample stay together in the same fold — an animal is never '
                     'split between train and validation. Tile-level predictions are then averaged '
@@ -3786,6 +3864,17 @@ def create_app(default_base_dir=None):
 
     default_base_dir = default_base_dir or os.getcwd()
 
+    @app.server.route('/nori-protein-explorer')
+    def serve_nori_protein_explorer():
+        params = flask.request.args
+        path = nori_protein_explorer_path(params.get('base_dir', ''), params.get('group', ''), params.get('task', ''))
+        if path is None:
+            return (
+                f'{NORI_PROTEIN_EXPLORER_FILENAME} not found in outputs/&lt;group&gt;/&lt;task&gt;/features/ '
+                'for this selection.', 404,
+            )
+        return flask.send_file(path, mimetype='text/html')
+
     app.layout = html.Div([
         dcc.Location(id='url', refresh=False),
         html.Div(id='page-content'),
@@ -3882,6 +3971,18 @@ def register_callbacks(app, default_base_dir):
             return '#'
         query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
         return f'/features?{query}'
+
+    @app.callback(
+        Output('nori-protein-link', 'href'),
+        Input('base-dir-store', 'data'),
+        Input('group-dropdown', 'value'),
+        Input('task-dropdown', 'value'),
+    )
+    def update_nori_protein_link(base_dir, group, task):
+        if not (base_dir and group and task):
+            return '#'
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
+        return f'/nori-protein-explorer?{query}'
 
     @app.callback(
         Output('statistics-link', 'href'),
