@@ -128,6 +128,24 @@ html, body {
   flex: 1 1 220px;
 }
 
+/* Forces a dcc.Checklist/RadioItems' options onto one row, wrapping if needed -
+   targets the component's own root container, since its per-option labelStyle alone
+   doesn't override the default one-per-line layout. */
+.inline-checklist {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+}
+
+.inline-checklist label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  white-space: nowrap;
+}
+
 .btn-group {
   margin-top: 20px;
 }
@@ -466,6 +484,36 @@ a.btn-outline:hover {
 
 .zoom-scroll.region-select-active .zoom-image {
   cursor: crosshair;
+}
+
+/* On-screen scalebar HUD for the main viewer image: positioned against .plot-wrap
+   (not .zoom-scroll's scrolling content), so it stays pinned to the bottom-left
+   corner regardless of scroll position; its bar length/label are recomputed in JS
+   (noriUpdateScalebar) whenever the zoom level changes. */
+.image-scalebar {
+  position: absolute;
+  left: 16px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.image-scalebar-track {
+  height: 4px;
+  background: #fff;
+  border: 1px solid #000;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);
+}
+
+.image-scalebar-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 0 3px #000, 0 0 3px #000, 0 0 3px #000;
 }
 
 /* Rectangle/polygon region overlay, drawn in one SVG per .zoom-image-wrap so both

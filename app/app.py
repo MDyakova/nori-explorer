@@ -33,7 +33,8 @@ import plotly.graph_objs as go
 import seaborn as sns
 from dash import Input, Output, State, dcc, html
 from matplotlib.path import Path as MplPath
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+from scipy.ndimage import label as ndi_label
 from scipy.stats import f as f_distribution
 from scipy.stats import gaussian_kde, kruskal, linregress, mannwhitneyu, spearmanr, ttest_ind
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -55,6 +56,55 @@ REGION_COLORS = ['#0f766e', '#b45309', '#7c3aed', '#be123c', '#0369a1', '#15803d
 # quantitative units for region distribution/mean analysis.
 PROTEIN_CALIBRATION_K = 1.3643 * 1000 / 8192
 LIPID_CALIBRATION_K = 1.0101 * 1000 / 8192
+
+# Real-world size of one native-resolution image pixel, for scalebars.
+PIXEL_SIZE_UM = 0.4
+
+# "Nice" round scalebar lengths (microns) to choose from, smallest to largest.
+SCALEBAR_NICE_LENGTHS_UM = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000]
+
+
+def draw_scalebar(pil_img, um_per_px, target_fraction=0.18, margin_px=8):
+    """Draw a scalebar + "um" label into the bottom-left corner of pil_img, in place, and
+    return it. um_per_px is the real-world size of one pixel *in pil_img as given* (i.e.
+    PIXEL_SIZE_UM already divided by whatever display scale/resize was applied to reach
+    this image), so the bar's length is correct regardless of how much the image was
+    downscaled for display. Length is picked from SCALEBAR_NICE_LENGTHS_UM to land near
+    target_fraction of the image width. Does nothing if the image is too small for a
+    legible bar."""
+    width, height = pil_img.size
+    target_um = (width * target_fraction) * um_per_px
+    nice_lengths = [v for v in SCALEBAR_NICE_LENGTHS_UM if v >= target_um]
+    length_um = nice_lengths[0] if nice_lengths else SCALEBAR_NICE_LENGTHS_UM[-1]
+    bar_px = length_um / um_per_px
+
+    if bar_px < 2 or bar_px > width * 0.9:
+        return pil_img
+
+    # Plain "um" (not the µ sign) - PIL's default font doesn't reliably have that
+    # glyph at every size, which showed up as a garbled/missing-glyph box.
+    label = f'{length_um:g} um'
+    draw = ImageDraw.Draw(pil_img)
+    try:
+        font = ImageFont.load_default(size=max(11, round(height * 0.045)))
+    except TypeError:
+        font = ImageFont.load_default()
+
+    bar_height = max(3, round(height * 0.012))
+    x0 = margin_px
+    y1 = height - margin_px
+    y0 = y1 - bar_height
+    x1 = round(x0 + bar_px)
+
+    draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255), outline=(0, 0, 0), width=1)
+
+    bbox = draw.textbbox((0, 0), label, font=font)
+    text_h = bbox[3] - bbox[1]
+    draw.text(
+        (x0, max(0, y0 - text_h - 6)), label, font=font,
+        fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0),
+    )
+    return pil_img
 
 
 def is_valid_base_dir(base_dir):
@@ -235,25 +285,43 @@ def channels_txt_path(base_dir, group, task):
     return os.path.join(base_dir, 'outputs', group, task, 'channels.txt')
 
 
+def masks_txt_path(base_dir, group, task):
+    return os.path.join(base_dir, 'outputs', group, task, 'masks.txt')
+
+
+def _parse_indexed_names_file(path):
+    """Parse a '<idx>:<name>' per-line file (channels.txt / masks.txt format) into an
+    ordered {index: name} dict. Returns {} if the file is missing or has no parsable
+    lines."""
+    names = {}
+    if not os.path.isfile(path):
+        return names
+    # utf-8-sig quietly strips a leading BOM, which Notepad-saved "UTF-8" files on
+    # Windows often have and which would otherwise break parsing of the first line.
+    with open(path, encoding='utf-8-sig') as f:
+        for line in f:
+            line = line.strip()
+            if not line or ':' not in line:
+                continue
+            idx_str, name = line.split(':', 1)
+            idx_str = idx_str.strip()
+            if idx_str.lstrip('-').isdigit():
+                names[int(idx_str)] = name.strip()
+    return names
+
+
 def load_channel_names(base_dir, group, task):
     """Read outputs/<group>/<task>/channels.txt (lines like '0:protein') into an
-    ordered {index: name} dict. Falls back to {0: 'protein', 1: 'lipid'} if missing
-    or unparsable."""
-    path = channels_txt_path(base_dir, group, task)
-    channels = {}
-    if os.path.isfile(path):
-        # utf-8-sig quietly strips a leading BOM, which Notepad-saved "UTF-8" files on
-        # Windows often have and which would otherwise break parsing of the first line.
-        with open(path, encoding='utf-8-sig') as f:
-            for line in f:
-                line = line.strip()
-                if not line or ':' not in line:
-                    continue
-                idx_str, name = line.split(':', 1)
-                idx_str = idx_str.strip()
-                if idx_str.lstrip('-').isdigit():
-                    channels[int(idx_str)] = name.strip()
-    return channels if channels else {0: 'protein', 1: 'lipid'}
+    ordered {index: name} dict, falling back to {0: 'protein', 1: 'lipid'} if missing or
+    unparsable. Also merges in outputs/<group>/<task>/masks.txt, if present - same
+    '<idx>:<name>' format (e.g. '7:tubules'), same index space as channels.txt (the
+    masks are extra channels in the same .tif) - so segmentation masks (tubules, nuclei,
+    lumen, brush border, ...) show up as selectable channels alongside protein/lipid."""
+    channels = _parse_indexed_names_file(channels_txt_path(base_dir, group, task))
+    if not channels:
+        channels = {0: 'protein', 1: 'lipid'}
+    channels.update(_parse_indexed_names_file(masks_txt_path(base_dir, group, task)))
+    return channels
 
 
 def find_channel_index(channel_names, target_name, fallback_idx):
@@ -1803,15 +1871,12 @@ def resolve_whole_image_path(base_dir, group, image_name):
 
     for class_name in sorted(os.listdir(data_group_dir)):
         if '_' + class_name in image_name:
-            candidate = os.path.join(data_group_dir, class_name, image_name + '.tif')
-            if os.path.exists(candidate):
-                return data_group_dir, candidate
+            for ext in ('.tif', '.tiff'):
+                candidate = os.path.join(data_group_dir, class_name, image_name + ext)
+                if os.path.exists(candidate):
+                    return data_group_dir, candidate
 
     return data_group_dir, None
-
-
-ORIGINAL_OVERLAY_FIG_WIDTH = 30
-ORIGINAL_OVERLAY_FIG_HEIGHT = 10
 
 
 def overlay_pred_range(base_dir, group, task, model_name):
@@ -1828,12 +1893,11 @@ def overlay_pred_range(base_dir, group, task, model_name):
 
 def build_whole_image_overlay(
     base_dir, group, task, model_name, image_name,
-    fig_width=ORIGINAL_OVERLAY_FIG_WIDTH, fig_height=ORIGINAL_OVERLAY_FIG_HEIGHT,
 ):
     data_group_dir, tif_path = resolve_whole_image_path(base_dir, group, image_name)
     if tif_path is None:
         raise FileNotFoundError(
-            f'No matching .tif for "{image_name}" found under {data_group_dir} '
+            f'No matching .tif/.tiff for "{image_name}" found under {data_group_dir} '
             f'(looked in each class subfolder for a name containing "_<class>").'
         )
 
@@ -1875,20 +1939,27 @@ def build_whole_image_overlay(
         count_map[y:y + tile_size, x:x + tile_size] += 1
 
     pred_map = np.divide(pred_map, count_map, out=np.zeros_like(pred_map), where=count_map > 0)
-    pred_overlay = np.ma.masked_where(count_map == 0, pred_map)
+    has_pred = count_map > 0
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    ax.imshow(gray_image, cmap='gray')
-    ax.imshow(pred_overlay, cmap='jet', alpha=0.45, vmin=pred_vmin, vmax=pred_vmax)
-    ax.axis('off')
-
-    # No title/padding baked in: the saved PNG's content must line up pixel-for-pixel
-    # (as a plain fraction-of-width/height) with the original image, so that a click's
-    # fractional position on it can be mapped back to original-image tiles — see
+    # Composite the heatmap over the grayscale base directly at the image's native
+    # pixel resolution (no matplotlib figure/dpi step), so the saved PNG still has
+    # real detail to show once zoomed in, instead of stretching a fixed low-res
+    # raster. This also keeps the PNG's content lined up pixel-for-pixel (as a plain
+    # fraction-of-width/height) with the original image, so a click's fractional
+    # position on it can be mapped back to original-image tiles — see
     # find_tiles_at_fraction.
+    gray_min, gray_max = float(gray_image.min()), float(gray_image.max())
+    gray_norm = (gray_image - gray_min) / ((gray_max - gray_min) or 1.0)
+    base_rgb = np.repeat(gray_norm[:, :, None], 3, axis=2)
+
+    pred_norm = np.clip((pred_map - pred_vmin) / ((pred_vmax - pred_vmin) or 1.0), 0, 1)
+    overlay_rgb = matplotlib.colormaps['jet'](pred_norm)[:, :, :3]
+
+    alpha = np.where(has_pred, 0.45, 0.0)[:, :, None]
+    composite = np.clip((base_rgb * (1 - alpha) + overlay_rgb * alpha) * 255, 0, 255).astype(np.uint8)
+
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=90, bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
+    Image.fromarray(composite, mode='RGB').save(buf, format='PNG')
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}', tif_path, tile_size, pred_vmin, pred_vmax
 
@@ -1961,6 +2032,17 @@ def build_overlay_colorbar(vmin, vmax):
     return Image.open(buf).convert('RGB')
 
 
+# Segmentation masks from masks.txt: binary presence (nuclei/lumen/brush border are
+# literally 0/1; tubules is a per-instance id, but for the "channels" overlay we only
+# care whether a pixel belongs to *some* tubule - individual tubules can instead be
+# picked out with the "Tubule" click-to-select tool, see region_bbox_and_mask) rather
+# than a continuous intensity, so they're shown as a flat-color overlay wherever the
+# mask is nonzero - see compose_channels - instead of the outlier-clipped/percentile-
+# scaled treatment used for protein/lipid/other intensity channels (which would
+# incorrectly zero out sparse masks, e.g. nuclei, in tiles where less than 1% of pixels
+# are foreground).
+MASK_CHANNEL_NAMES = {'tubules', 'nuclei', 'lumen', 'brush border'}
+
 # protein/lipid keep their familiar red/green look; any other selected channel cycles
 # through this palette so any number of channels (1, 2, 3, ...) can be shown at once.
 CHANNEL_DEFAULT_COLORS = {'protein': (1.0, 0.0, 0.0), 'lipid': (0.0, 1.0, 0.0)}
@@ -2009,7 +2091,12 @@ def channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l):
     - NORM_MODE_PER_IMAGE: every channel (including protein/lipid) is stretched to its
       own max value after image_filter's per-image outlier clipping, i.e. the same
       filtered layer compose_channels actually displays — so each image uses its own
-      full display range regardless of the calibration file."""
+      full display range regardless of the calibration file.
+    Mask channels (see MASK_CHANNEL_NAMES) always normalize to 1.0, regardless of
+    norm_mode - compose_channels shows them as a flat 0/1 presence overlay, not a
+    percentile-scaled intensity."""
+    if name in MASK_CHANNEL_NAMES:
+        return 1.0
     if norm_mode == NORM_MODE_PER_IMAGE:
         filtered = image_filter(image[idx:idx + 1].astype(float))[0]
         value = float(filtered.max())
@@ -2026,14 +2113,20 @@ def compose_channels(image, channel_indices, channel_names, channel_norm_max):
     """Additively blend the given channel indices of a (C, H, W) raw image array into
     one (H, W, 3) float composite in [0, 1]. Each channel is tinted by its own color —
     protein=red, lipid=green by default, everything else cycles through a fixed
-    palette — so any number of channels (1, 2, 3, ...) can be shown at once."""
+    palette — so any number of channels (1, 2, 3, ...) can be shown at once. Mask
+    channels (MASK_CHANNEL_NAMES) skip the outlier-clip/percentile scaling used for
+    intensity channels and are instead shown as a flat tint wherever the mask is
+    nonzero, since they're segmentation labels, not intensities."""
     h, w = image.shape[1], image.shape[2]
     composite = np.zeros((h, w, 3), dtype=float)
     palette_i = 0
     for idx in channel_indices:
         name = channel_names.get(idx, str(idx)).lower()
-        channel_layer = image_filter(image[idx:idx + 1].astype(float))[0]
-        channel_layer = channel_layer / channel_norm_max(idx)
+        if name in MASK_CHANNEL_NAMES:
+            channel_layer = (image[idx] != 0).astype(float)
+        else:
+            channel_layer = image_filter(image[idx:idx + 1].astype(float))[0]
+            channel_layer = channel_layer / channel_norm_max(idx)
 
         color = channel_color(name, palette_i)
         if name not in CHANNEL_DEFAULT_COLORS:
@@ -2082,7 +2175,14 @@ def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0, cha
     if (width, height) != pil_img.size:
         pil_img = pil_img.resize((width, height), resample=Image.LANCZOS)
 
+    # No baked-in scalebar here: this image is shown zoomable/scrollable in the
+    # browser (see .zoom-image / data-um-per-px), where a dynamic on-screen scalebar
+    # (assets/plot_toolbar.js) recomputes itself as the viewer zooms, rather than
+    # scaling a fixed bar drawn into the raster.
     return pil_img, tif_path, channel_max_values
+
+
+CHANNEL_CALIBRATION_K = {'protein': PROTEIN_CALIBRATION_K, 'lipid': LIPID_CALIBRATION_K}
 
 
 def build_channel_colorbars(channel_indices, channel_names, channel_max_values):
@@ -2090,7 +2190,9 @@ def build_channel_colorbars(channel_indices, channel_names, channel_max_values):
     (protein=red, lipid=green, others per CHANNEL_COLOR_PALETTE) and 0..max range —
     rendered as its own standalone image next to the main viewer image, rather than
     baked into it, so the zoom/region-select pixel coordinates on that image stay
-    untouched. Protein/lipid are labeled in mg/mL."""
+    untouched. Protein/lipid are labeled and scaled in mg/mL, using the same
+    PROTEIN_CALIBRATION_K/LIPID_CALIBRATION_K applied to region-analysis pixel values
+    (build_region_analysis), so the colorbar's numbers match those plots' units."""
     n = len(channel_indices)
     fig, axes = plt.subplots(1, n, figsize=(0.7 * n, 1.75), constrained_layout=True)
     axes = [axes] if n == 1 else list(axes)
@@ -2103,8 +2205,9 @@ def build_channel_colorbars(channel_indices, channel_names, channel_max_values):
         if key not in CHANNEL_DEFAULT_COLORS:
             palette_i += 1
 
+        display_max = channel_max_values.get(idx, 1.0) * CHANNEL_CALIBRATION_K.get(key, 1.0)
         cmap = matplotlib.colors.LinearSegmentedColormap.from_list(f'ch_{idx}', [(0, 0, 0), color])
-        norm = matplotlib.colors.Normalize(vmin=0, vmax=channel_max_values.get(idx, 1.0))
+        norm = matplotlib.colors.Normalize(vmin=0, vmax=display_max)
         cbar = fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), cax=ax)
         label = f'{name} (mg/mL)' if key in ('protein', 'lipid') else name
         cbar.set_label(label, fontsize=8)
@@ -2144,11 +2247,35 @@ def remove_outliers_1d(values, k=1.5):
     return values[mask] if mask.sum() >= 2 else values
 
 
-def region_bbox_and_mask(points, kind, w, h):
+def region_bbox_and_mask(points, kind, w, h, tubule_mask=None):
     """points: list of {'x': frac, 'y': frac} in [0, 1] (relative to the image's own
     width/height). Returns the pixel bounding box (x0, y0, x1, y1) plus a boolean mask
-    over that box selecting the pixels actually inside the region — None for a
-    rectangle (the whole crop is the region), or a polygon-shaped mask for a polygon."""
+    over that box selecting the pixels actually inside the region:
+    - 'rect': None (the whole box is the region)
+    - 'polygon': a polygon-shaped mask
+    - 'tubule': a single click point in `points`; tubule_mask (the full-image raw
+      'tubules' channel, each tubule's pixels holding its own nonzero id) is looked up
+      at that point to get the clicked tubule's id, then restricted to just the
+      connected blob of same-id pixels touching the click (via scipy's connected-
+      component labeling) - not every pixel anywhere in the image that happens to share
+      that id, since an id isn't guaranteed globally unique (e.g. an 8-bit mask can only
+      hold 255 distinct values, so unrelated tubules elsewhere in a large image can
+      collide onto the same one). The box is cropped tightly to that blob. Raises
+      ValueError if the click landed on background (id 0)."""
+    if kind == 'tubule':
+        click_x = int(np.clip(round(points[0]['x'] * w), 0, w - 1))
+        click_y = int(np.clip(round(points[0]['y'] * h), 0, h - 1))
+        tubule_id = tubule_mask[click_y, click_x]
+        if tubule_id == 0:
+            raise ValueError('No tubule at the clicked point.')
+        same_id_mask = tubule_mask == tubule_id
+        labeled_components, _ = ndi_label(same_id_mask)
+        full_mask = labeled_components == labeled_components[click_y, click_x]
+        ys, xs = np.where(full_mask)
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        return x0, y0, x1, y1, full_mask[y0:y1, x0:x1]
+
     xs = [p['x'] * w for p in points]
     ys = [p['y'] * h for p in points]
     x0 = int(np.clip(round(min(xs)), 0, w))
@@ -2166,16 +2293,78 @@ def region_bbox_and_mask(points, kind, w, h):
     return x0, y0, x1, y1, mask
 
 
+# Tissue-compartment filters for region distribution/boxplot computation: restrict the
+# region's pixels to just the part belonging to one segmented sub-structure, using the
+# nuclei/lumen/brush border/tubules mask channels (masks.txt). 'whole' is the existing
+# no-filter behavior.
+COMPARTMENT_LABELS = {
+    'whole': 'Whole area', 'nuclei': 'Nuclei', 'lumen': 'Lumen',
+    'brush_border': 'Brush border', 'cytoplasm': 'Cytoplasm',
+}
+COMPARTMENT_SHORT_LABELS = {'whole': '', 'nuclei': 'N', 'lumen': 'L', 'brush_border': 'BB', 'cytoplasm': 'Cyto'}
+
+
+def compartment_pixel_mask(image, channel_names, compartment, y0, y1, x0, x1):
+    """Boolean mask, shaped like the (y0:y1, x0:x1) crop, selecting the pixels of that
+    crop belonging to the given tissue compartment — None for 'whole' (no restriction).
+    'nuclei'/'lumen'/'brush_border' are that mask channel's own presence (>0); 'cytoplasm'
+    is tubule pixels (id > 0) that aren't nuclei, lumen, or brush border. Raises
+    ValueError naming the missing channel if a required mask channel isn't present
+    (e.g. no masks.txt, or masks.txt is missing an entry for it)."""
+    if compartment == 'whole':
+        return None
+
+    def channel_presence(name):
+        idx = next((i for i, n in channel_names.items() if n.lower() == name), None)
+        if idx is None:
+            raise ValueError(
+                f"No '{name}' channel found - add a masks.txt entry for it to compute "
+                f'the {COMPARTMENT_LABELS[compartment]} compartment.'
+            )
+        return image[idx][y0:y1, x0:x1] != 0
+
+    if compartment in ('nuclei', 'lumen'):
+        return channel_presence(compartment)
+    if compartment == 'brush_border':
+        return channel_presence('brush border')
+    if compartment == 'cytoplasm':
+        return (
+            channel_presence('tubules')
+            & ~channel_presence('nuclei') & ~channel_presence('lumen') & ~channel_presence('brush border')
+        )
+    raise ValueError(f'Unknown compartment: {compartment}')
+
+
+def region_result_label(r):
+    """Display label for one (region, compartment) result — 'Region 2' for the whole
+    area, 'Region 2 · Nuclei' etc. for a sub-compartment — used in combined-plot
+    legends so sibling compartments of the same region stay distinguishable."""
+    base = f'Region {r["entry_index"] + 1}'
+    short = COMPARTMENT_SHORT_LABELS[r['compartment']]
+    return f'{base} · {COMPARTMENT_LABELS[r["compartment"]]}' if short else base
+
+
+def region_result_short_label(r):
+    """Compact boxplot x-axis label for one (region, compartment) result — '2' for the
+    whole area, '2·N' etc. for a sub-compartment."""
+    short = COMPARTMENT_SHORT_LABELS[r['compartment']]
+    return f'{r["entry_index"] + 1}·{short}' if short else str(r['entry_index'] + 1)
+
+
 def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thumb_px=220,
-                           channel_indices=None, norm_mode=NORM_MODE_GLOBAL):
-    """For a region — {'type': 'rect', 'points': [{x0,y0}, {x1,y1}]} or
-    {'type': 'polygon', 'points': [{x,y}, ...]} (all fractional, relative to the image's
-    own width/height) — return a composite thumbnail of the cropped region (pixels
-    outside a polygon are blacked out) — showing every channel in channel_indices
-    (default: protein/lipid), tinted/blended the same way as the main viewer (norm_mode
-    picks the same display normalization — see channel_norm_max_value) — plus its
-    (outlier-removed, calibrated) protein/lipid pixel values and means, which are always
-    computed from raw pixel intensities and unaffected by norm_mode."""
+                           channel_indices=None, norm_mode=NORM_MODE_GLOBAL, compartment='whole'):
+    """For a region — {'type': 'rect', 'points': [{x0,y0}, {x1,y1}]}, {'type': 'polygon',
+    'points': [{x,y}, ...]}, or {'type': 'tubule', 'points': [{x,y}]} (a single click
+    point; the region becomes every pixel sharing that point's id in the 'tubules' mask
+    channel - see masks.txt and region_bbox_and_mask) — all point coordinates
+    fractional, relative to the image's own width/height — return a composite thumbnail
+    of the cropped region (pixels outside the region's mask are blacked out) — showing
+    every channel in channel_indices (default: protein/lipid), tinted/blended the same
+    way as the main viewer (norm_mode picks the same display normalization — see
+    channel_norm_max_value) — plus its (outlier-removed, calibrated) protein/lipid pixel
+    values and means, which are always computed from raw pixel intensities and
+    unaffected by norm_mode. compartment (see COMPARTMENT_LABELS) further restricts the
+    region's pixels to one tissue sub-structure — see compartment_pixel_mask."""
     tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
     channel_names = load_channel_names(base_dir, group, task)
     max_p, max_l = load_max_values(base_dir, group, task)
@@ -2187,9 +2376,27 @@ def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thu
         image = tif.asarray()
 
     h, w = image[0].shape
-    x0, y0, x1, y1, mask = region_bbox_and_mask(region['points'], region.get('type', 'rect'), w, h)
+    region_type = region.get('type', 'rect')
+    if region_type == 'tubule':
+        tubule_idx = next((idx for idx, n in channel_names.items() if n.lower() == 'tubules'), None)
+        if tubule_idx is None:
+            raise ValueError(
+                "No 'tubules' channel found - add a masks.txt entry (e.g. '7:tubules') "
+                'to use the Tubule selection tool.'
+            )
+        x0, y0, x1, y1, mask = region_bbox_and_mask(
+            region['points'], region_type, w, h, tubule_mask=image[tubule_idx],
+        )
+    else:
+        x0, y0, x1, y1, mask = region_bbox_and_mask(region['points'], region_type, w, h)
     if x1 - x0 < 2 or y1 - y0 < 2 or (mask is not None and mask.sum() < 4):
         raise ValueError('Selected region is too small to analyze.')
+
+    compartment_mask = compartment_pixel_mask(image, channel_names, compartment, y0, y1, x0, x1)
+    if compartment_mask is not None:
+        mask = compartment_mask if mask is None else (mask & compartment_mask)
+        if mask.sum() < 4:
+            raise ValueError(f'No {COMPARTMENT_LABELS[compartment]} pixels in this region.')
 
     def channel_norm_max(idx):
         name = channel_names.get(idx, '').lower()
@@ -2207,6 +2414,7 @@ def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thu
             (max(1, round(thumb.width * thumb_scale)), max(1, round(thumb.height * thumb_scale))),
             resample=Image.LANCZOS,
         )
+    draw_scalebar(thumb, PIXEL_SIZE_UM / thumb_scale)
 
     def masked_values(idx):
         crop = image[idx][y0:y1, x0:x1].astype(float)
@@ -2222,21 +2430,29 @@ def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thu
     # Any other selected channel (e.g. AQP2) also gets its own outlier-removed pixel
     # values, in selection order, so it can show up in the cross-region boxplot too —
     # kept separate from protein/lipid since those have real calibration/units and
-    # drive the joint KDE plot, while these are just raw per-channel intensities.
+    # drive the joint KDE plot, while these are just raw per-channel intensities. Mask
+    # channels (MASK_CHANNEL_NAMES) are excluded: they're segmentation labels (0/1
+    # presence, or a per-instance id for tubules), not intensities, so a boxplot of
+    # their raw values wouldn't mean anything.
     extra_channels = []
     for idx in channel_indices:
         if idx in (protein_idx, lipid_idx):
             continue
         name = channel_names.get(idx, str(idx))
+        if name.lower() in MASK_CHANNEL_NAMES:
+            continue
         values = remove_outliers_1d(masked_values(idx))
         extra_channels.append((name, values))
 
     return thumb, (x0, y0, x1, y1), protein, lipid, mean_protein, mean_lipid, n_outliers, extra_channels
 
 
-def build_combined_distribution_plot(region_results, max_points_per_region=5000):
-    """Overlay every selected region's protein-vs-lipid pixel distribution on one
-    large kdeplot, colored and labeled by region so regions can be compared directly."""
+def build_combined_distribution_plot(region_results, kind='kde', max_points_per_region=5000):
+    """Overlay every selected region's protein-vs-lipid pixel distribution on one large
+    plot, colored and labeled by region so regions can be compared directly. kind='kde'
+    draws density contours (falling back to a scatter plot if there are too few/
+    degenerate points to fit a KDE); kind='scatter' always draws a plain scatter plot of
+    the raw pixel values."""
     rng = np.random.default_rng(0)
     frames = []
     for i, r in enumerate(region_results):
@@ -2244,22 +2460,30 @@ def build_combined_distribution_plot(region_results, max_points_per_region=5000)
         if protein.size > max_points_per_region:
             idx = rng.choice(protein.size, max_points_per_region, replace=False)
             protein, lipid = protein[idx], lipid[idx]
-        frames.append(pd.DataFrame({'protein': protein, 'lipid': lipid, 'region': f'Region {i + 1}'}))
+        frames.append(pd.DataFrame({'protein': protein, 'lipid': lipid, 'region': region_result_label(r)}))
     combined_df = pd.concat(frames, ignore_index=True)
 
-    palette = {f'Region {i + 1}': REGION_COLORS[i % len(REGION_COLORS)] for i in range(len(region_results))}
+    palette = {
+        region_result_label(r): REGION_COLORS[i % len(REGION_COLORS)] for i, r in enumerate(region_results)
+    }
 
     fig, ax = plt.subplots(figsize=(4.0625, 3.75))
-    try:
-        sns.kdeplot(
-            data=combined_df, x='protein', y='lipid', hue='region', palette=palette,
-            levels=6, thresh=0.05, linewidths=1.6, ax=ax,
-        )
-    except Exception:
+    if kind == 'scatter':
         sns.scatterplot(
             data=combined_df, x='protein', y='lipid', hue='region', palette=palette,
             s=8, alpha=0.35, linewidth=0, ax=ax,
         )
+    else:
+        try:
+            sns.kdeplot(
+                data=combined_df, x='protein', y='lipid', hue='region', palette=palette,
+                levels=6, thresh=0.05, linewidths=1.6, ax=ax,
+            )
+        except Exception:
+            sns.scatterplot(
+                data=combined_df, x='protein', y='lipid', hue='region', palette=palette,
+                s=8, alpha=0.35, linewidth=0, ax=ax,
+            )
     if ax.get_legend() is not None:
         sns.move_legend(ax, 'center left', bbox_to_anchor=(1.02, 0.5), frameon=True, title=None)
     ax.set_xlabel('Protein (mg/mL)')
@@ -2293,7 +2517,7 @@ def build_region_boxplot(region_results):
     for i, name in enumerate(extra_names):
         channel_data.append((name, [r['extra_channels'][i][1] for r in region_results]))
 
-    labels = [str(i + 1) for i in range(len(region_results))]
+    labels = [region_result_short_label(r) for r in region_results]
     colors = [REGION_COLORS[i % len(REGION_COLORS)] for i in range(len(region_results))]
 
     fig, axes = plt.subplots(1, len(channel_data), figsize=(4.0625, 3.75))
@@ -3381,12 +3605,16 @@ def image_viewer_page_layout(base_dir, group, task):
         find_channel_index(channel_names, 'lipid', 1),
     })
 
+    masks_found = os.path.isfile(masks_txt_path(base_dir, group, task))
+
     if channels_found:
         channels_status = f'channels.txt: {channels_path}  ·  {len(channel_names)} channel(s) loaded'
         channels_status_class = 'status-text'
     else:
         channels_status = f'channels.txt not found at: {channels_path}  ·  showing protein/lipid only'
         channels_status_class = 'status-text status-error'
+    if masks_found:
+        channels_status += '  ·  masks.txt found, mask channels merged in'
 
     return html.Div(className='app-shell', children=[
         html.A('← Back to explorer', href='/', className='btn-outline'),
@@ -3425,12 +3653,12 @@ def image_viewer_page_layout(base_dir, group, task):
                 dcc.RadioItems(
                     id='viewer-norm-mode',
                     options=NORM_MODE_OPTIONS,
-                    value=NORM_MODE_GLOBAL,
+                    value=NORM_MODE_PER_IMAGE,
                     labelStyle={'display': 'block'},
                 ),
             ], style={'marginTop': '14px'}),
             html.Div(
-                'No .tif images found under this group.', className='status-text status-error',
+                'No .tif/.tiff images found under this group.', className='status-text status-error',
             ) if not images else None,
             html.Button(
                 'Show image', id='viewer-show-button', n_clicks=0,
@@ -3455,13 +3683,19 @@ def image_viewer_page_layout(base_dir, group, task):
                     className='btn-outline', style={'flex': '0 0 auto'},
                 ),
                 html.Button(
+                    'Tubule', id='viewer-select-tubule-button', n_clicks=0,
+                    className='btn-outline', style={'flex': '0 0 auto'},
+                ),
+                html.Button(
                     'Clear regions', id='viewer-clear-regions-button', n_clicks=0,
                     className='btn-outline', style={'flex': '0 0 auto'},
                 ),
                 html.Div(
                     'Rectangle: drag to draw. Polygon: click each vertex, then double-click '
-                    "(or click the first vertex) to close it, Esc to cancel. Repeat to pick "
-                    "several regions; each one's protein/lipid distribution is plotted below.",
+                    "(or click the first vertex) to close it, Esc to cancel. Tubule: click a "
+                    "tubule to select every pixel sharing its id in the 'tubules' mask channel "
+                    "(masks.txt). Repeat to pick several regions; each one's protein/lipid "
+                    "distribution is plotted below.",
                     className='status-text', style={'marginTop': 0},
                 ),
             ]),
@@ -3482,9 +3716,13 @@ def image_viewer_page_layout(base_dir, group, task):
                         html.Div(className='zoom-image-wrap', children=[
                             html.Img(
                                 id='viewer-image', className='zoom-image',
-                                **{'data-image-path': ''},
+                                **{'data-image-path': '', 'data-um-per-px': ''},
                             ),
                         ]),
+                    ]),
+                    html.Div(className='image-scalebar', style={'display': 'none'}, children=[
+                        html.Div(className='image-scalebar-track'),
+                        html.Div(className='image-scalebar-label'),
                     ]),
                 ]),
                 html.Img(id='viewer-channel-colorbars', className='viewer-colorbars-img'),
@@ -3492,8 +3730,50 @@ def image_viewer_page_layout(base_dir, group, task):
         ]),
 
         html.Div(className='card', children=[
-            html.Div('Selected regions — protein / lipid distribution', className='card-title'),
+            html.Div(
+                className='field-row',
+                style={'justifyContent': 'space-between', 'alignItems': 'center', 'flexWrap': 'wrap'},
+                children=[
+                    html.Div(
+                        'Selected regions — protein / lipid distribution', className='card-title',
+                        style={'margin': 0, 'flex': '1 1 auto'},
+                    ),
+                    html.Div(
+                        style={
+                            'display': 'flex', 'alignItems': 'center', 'gap': '10px', 'flex': '0 0 auto',
+                        },
+                        children=[
+                            html.Label('Compute over', className='field-label', style={'margin': 0}),
+                            dcc.RadioItems(
+                                id='viewer-region-compartments',
+                                className='inline-checklist',
+                                options=[
+                                    {'label': 'Whole area', 'value': 'whole'},
+                                    {'label': 'Nuclei', 'value': 'nuclei'},
+                                    {'label': 'Lumen', 'value': 'lumen'},
+                                    {'label': 'Brush border', 'value': 'brush_border'},
+                                    {'label': 'Cytoplasm', 'value': 'cytoplasm'},
+                                ],
+                                value='whole',
+                            ),
+                        ],
+                    ),
+                ],
+            ),
             html.Div(id='region-plot-status', className='status-text'),
+            html.Div([
+                html.Label('Plots to show', className='field-label'),
+                dcc.Checklist(
+                    id='viewer-region-plot-types',
+                    className='inline-checklist',
+                    options=[
+                        {'label': 'KDE plot', 'value': 'kde'},
+                        {'label': 'Boxplot', 'value': 'boxplot'},
+                        {'label': 'Scatter plot', 'value': 'scatter'},
+                    ],
+                    value=['kde', 'boxplot'],
+                ),
+            ], style={'marginTop': '10px', 'marginBottom': '4px'}),
             html.Div(id='viewer-regions-container', className='region-list'),
         ]),
     ])
@@ -4198,6 +4478,7 @@ def register_callbacks(app, default_base_dir):
         Output('viewer-status', 'children'),
         Output('viewer-image', 'src'),
         Output('viewer-image', 'data-image-path'),
+        Output('viewer-image', 'data-um-per-px'),
         Output('viewer-channel-colorbars', 'src'),
         Input('viewer-show-button', 'n_clicks'),
         State('viewer-image-dropdown', 'value'),
@@ -4207,12 +4488,12 @@ def register_callbacks(app, default_base_dir):
     )
     def update_viewer_image(n_clicks, rel_image_path, channel_indices, norm_mode, context):
         if not (n_clicks and context and rel_image_path):
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
         if not channel_indices:
             return (
                 html.Span('Pick at least one channel.', className='status-error'),
-                dash.no_update, dash.no_update, None,
+                dash.no_update, dash.no_update, dash.no_update, None,
             )
 
         scale = 0.25
@@ -4220,10 +4501,13 @@ def register_callbacks(app, default_base_dir):
         try:
             pil_img, tif_path, channel_max_values = build_plain_nori_image(
                 context['base_dir'], context['group'], context['task'], rel_image_path, scale=scale,
-                channel_indices=channel_indices, norm_mode=norm_mode or NORM_MODE_GLOBAL,
+                channel_indices=channel_indices, norm_mode=norm_mode or NORM_MODE_PER_IMAGE,
             )
         except Exception:
-            return html.Pre(traceback.format_exc(), className='metrics-box'), None, dash.no_update, None
+            return (
+                html.Pre(traceback.format_exc(), className='metrics-box'),
+                None, dash.no_update, dash.no_update, None,
+            )
 
         channel_names = load_channel_names(context['base_dir'], context['group'], context['task'])
         channel_label = ', '.join(channel_names.get(idx, str(idx)) for idx in channel_indices)
@@ -4234,7 +4518,10 @@ def register_callbacks(app, default_base_dir):
             className='status-ok',
         )
         colorbars_img = build_channel_colorbars(channel_indices, channel_names, channel_max_values)
-        return status, pil_to_data_uri(pil_img), rel_image_path, pil_to_data_uri(colorbars_img)
+        return (
+            status, pil_to_data_uri(pil_img), rel_image_path, str(PIXEL_SIZE_UM / scale),
+            pil_to_data_uri(colorbars_img),
+        )
 
     @app.callback(
         Output('region-plot-status', 'children'),
@@ -4242,11 +4529,16 @@ def register_callbacks(app, default_base_dir):
         Input('viewer-region-input', 'value'),
         Input('viewer-channel-dropdown', 'value'),
         Input('viewer-norm-mode', 'value'),
+        Input('viewer-region-plot-types', 'value'),
+        Input('viewer-region-compartments', 'value'),
         State('viewer-context-store', 'data'),
     )
-    def update_regions(region_json, channel_indices, norm_mode, context):
+    def update_regions(region_json, channel_indices, norm_mode, plot_types, compartment, context):
         if not context:
             return dash.no_update, dash.no_update
+
+        plot_types = set(plot_types or [])
+        compartment = compartment or 'whole'
 
         try:
             entries = json.loads(region_json) if region_json else []
@@ -4257,36 +4549,47 @@ def register_callbacks(app, default_base_dir):
             return '', []
 
         region_results = []
+        skipped_notes = []
         try:
-            for entry in entries:
+            for entry_index, entry in enumerate(entries):
                 rel_image_path = entry['image']
                 region = {'type': entry.get('type', 'rect'), 'points': entry['points']}
-                thumb, px_bbox, protein, lipid, mean_protein, mean_lipid, n_outliers, extra_channels = (
-                    build_region_analysis(
-                        context['base_dir'], context['group'], context['task'], rel_image_path,
-                        region, channel_indices=channel_indices, norm_mode=norm_mode or NORM_MODE_GLOBAL,
+                try:
+                    thumb, px_bbox, protein, lipid, mean_protein, mean_lipid, n_outliers, extra_channels = (
+                        build_region_analysis(
+                            context['base_dir'], context['group'], context['task'], rel_image_path,
+                            region, channel_indices=channel_indices,
+                            norm_mode=norm_mode or NORM_MODE_PER_IMAGE, compartment=compartment,
+                        )
                     )
-                )
+                except ValueError as exc:
+                    # Expected/recoverable (e.g. "no nuclei pixels in this region") - skip
+                    # just this region instead of failing the whole render.
+                    skipped_notes.append(f'Region {entry_index + 1} · {COMPARTMENT_LABELS[compartment]}: {exc}')
+                    continue
                 region_results.append({
                     'thumb': thumb, 'px_bbox': px_bbox, 'image': rel_image_path, 'type': region['type'],
                     'protein': protein, 'lipid': lipid,
                     'mean_protein': mean_protein, 'mean_lipid': mean_lipid, 'n_outliers': n_outliers,
                     'extra_channels': extra_channels,
+                    'entry_index': entry_index, 'compartment': compartment,
                 })
         except Exception:
             return html.Pre(traceback.format_exc(), className='metrics-box'), []
 
         cards = []
         for i, r in enumerate(region_results):
-            color = REGION_COLORS[i % len(REGION_COLORS)]
+            color = REGION_COLORS[r['entry_index'] % len(REGION_COLORS)]
             x0, y0, x1, y1 = r['px_bbox']
-            shape_label = 'polygon' if r['type'] == 'polygon' else 'rect'
+            shape_label = {'polygon': 'polygon', 'tubule': 'tubule'}.get(r['type'], 'rect')
+            compartment_label = COMPARTMENT_LABELS[r['compartment']]
             cards.append(html.Div(className='region-card', children=[
                 html.Div(className='region-card-header', children=[
-                    html.Span(str(i + 1), className='region-card-badge', style={'background': color}),
+                    html.Span(str(r['entry_index'] + 1), className='region-card-badge', style={'background': color}),
                     html.Div([
                         html.Span(
-                            f'{r["image"]}  ·  {shape_label}  ·  x[{x0}:{x1}]  y[{y0}:{y1}]  '
+                            f'{r["image"]}  ·  {shape_label}  ·  {compartment_label}  ·  '
+                            f'x[{x0}:{x1}]  y[{y0}:{y1}]  '
                             f'({r["protein"].size} px, {r["n_outliers"]} outlier px removed)',
                             className='region-card-title',
                         ),
@@ -4297,33 +4600,54 @@ def register_callbacks(app, default_base_dir):
                     ]),
                     html.Button(
                         '✕', title='Delete this region', className='region-delete-btn',
-                        **{'data-region-index': str(i)},
+                        **{'data-region-index': str(r['entry_index'])},
                     ),
                 ]),
                 html.Div(className='region-thumb-wrap', children=[
                     plot_with_toolbar(
                         html.Img(src=pil_to_data_uri(r['thumb']), className='region-thumb-img'),
-                        f'region_{i + 1}_thumbnail',
+                        f'region_{r["entry_index"] + 1}_{r["compartment"]}_thumbnail',
                     ),
                 ]),
             ]))
 
-        if region_results:
-            combined_dist = build_combined_distribution_plot(region_results)
+        if region_results and 'kde' in plot_types:
+            kde_dist = build_combined_distribution_plot(region_results, kind='kde')
             cards.append(html.Div(className='region-card region-combined-card', children=[
                 html.Div(className='region-card-header', children=[
                     html.Span('All', className='region-card-badge', style={'background': '#1a1d23'}),
-                    html.Span('Combined distribution — all regions overlaid', className='region-card-title'),
+                    html.Span(
+                        'Combined distribution — all regions overlaid (KDE)', className='region-card-title',
+                    ),
                 ]),
                 plot_with_toolbar(
                     html.Img(
-                        src=pil_to_data_uri(combined_dist), className='umap-card-img',
+                        src=pil_to_data_uri(kde_dist), className='umap-card-img',
                         style={'width': '62.5%'},
                     ),
-                    'all_regions_combined_distribution',
+                    'all_regions_kde_distribution',
                 ),
             ]))
 
+        if region_results and 'scatter' in plot_types:
+            scatter_dist = build_combined_distribution_plot(region_results, kind='scatter')
+            cards.append(html.Div(className='region-card region-combined-card', children=[
+                html.Div(className='region-card-header', children=[
+                    html.Span('All', className='region-card-badge', style={'background': '#1a1d23'}),
+                    html.Span(
+                        'Combined distribution — all regions overlaid (scatter)', className='region-card-title',
+                    ),
+                ]),
+                plot_with_toolbar(
+                    html.Img(
+                        src=pil_to_data_uri(scatter_dist), className='umap-card-img',
+                        style={'width': '62.5%'},
+                    ),
+                    'all_regions_scatter_distribution',
+                ),
+            ]))
+
+        if region_results and 'boxplot' in plot_types:
             boxplot_img = build_region_boxplot(region_results)
             cards.append(html.Div(className='region-card', children=[
                 html.Div(className='region-card-header', children=[
@@ -4339,10 +4663,17 @@ def register_callbacks(app, default_base_dir):
                 ),
             ]))
 
+        if not region_results:
+            return html.Div([
+                html.Span('No compartment data to show for the current selection.', className='status-error'),
+                html.Div([html.Div(note) for note in skipped_notes], className='status-text'),
+            ]), []
+
         total_pixels = sum(r['protein'].size for r in region_results)
-        status = html.Span(
-            f'{len(region_results)} region(s) selected · {total_pixels} px total', className='status-ok',
-        )
+        status_text = f'{len(region_results)} region/compartment result(s) · {total_pixels} px total'
+        if skipped_notes:
+            status_text += f'  ·  {len(skipped_notes)} skipped (no matching pixels)'
+        status = html.Span(status_text, className='status-ok')
         return status, cards
 
     @app.callback(
