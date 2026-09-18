@@ -72,7 +72,8 @@ for the whole-image overlay and image viewer, `data/`:
 │           └── features/                     # optional, for the "Features" page
 │               ├── tubule_features.csv              # tubule-level features, every sample
 │               ├── nuclei_features.csv               # per-nucleus features, every sample
-│               └── shape_features.csv                # per-tubule shape features, every sample
+│               ├── shape_features.csv                # per-tubule shape features, every sample
+│               └── nori_protein_explorer.html        # optional, opened by the "NORI + Proteomics" button
 └── data/
     └── <group>/
         └── <class_name>/
@@ -109,8 +110,9 @@ as before. Edits take effect on the next page load / group selection — no rest
 
 - **Main page** — set the data folder, pick a group / task, and jump to any of the pages
   below. Also has an "About this model" explainer (what the multimodal model is, how the
-  four modalities/inputs are fused, what its outputs mean) with a collapsible gallery of
-  every reference diagram from the model-explanation deck.
+  protein/lipid/optional fluorescent-marker inputs are fused, what its outputs mean) with a collapsible gallery of
+  every reference diagram from the model-explanation deck. The "NORI + Proteomics" button
+  opens `outputs/<group>/<task>/features/nori_protein_explorer.html` in a new tab.
 - **UMAP explorer** ("Show UMAP") — pick a model, view its UMAP scatter plot, regression
   metrics (MAE, R²) and attention-score boxplots by age; click a point to inspect its tile
   heatmap.
