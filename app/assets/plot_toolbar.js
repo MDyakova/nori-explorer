@@ -149,6 +149,8 @@ function noriApplyZoom(img, pct, clientX, clientY) {
     readout.textContent = 'Zoom: ' + pct + '%';
   }
 
+  noriUpdateScalebar(img);
+
   if (scroller) {
     // Wait for layout to pick up the new width before recentring the scroll position.
     requestAnimationFrame(function () {
@@ -163,21 +165,62 @@ function noriCurrentZoom(img) {
   return parseFloat(img.dataset.zoomPct || '100') || 100;
 }
 
-// Zoom percentage that fits the whole (natural-size) image inside its .zoom-scroll
-// viewport — scales down for images bigger than the visible area, but never scales up
-// past 100% (native resolution) for images that are already smaller than it.
+// "Nice" round scalebar lengths (microns), mirroring SCALEBAR_NICE_LENGTHS_UM in
+// app.py's draw_scalebar.
+var NORI_SCALEBAR_NICE_UM = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000];
+
+// Recompute and show/hide the on-screen scalebar (a sibling .image-scalebar div in the
+// image's .plot-wrap) for a .zoom-image that carries a data-um-per-px attribute — the
+// real-world size, in microns, of one pixel of the *served* image file, before any CSS
+// zoom is applied. Called whenever the displayed zoom level changes (see
+// noriApplyZoom), so the bar always reflects the current zoom; it doesn't need to be
+// recomputed on scroll since it's positioned against .plot-wrap, not the scrolled
+// image content, so it naturally stays put in the viewport's corner.
+function noriUpdateScalebar(img) {
+  var wrap = img.closest('.plot-wrap');
+  var bar = wrap ? wrap.querySelector('.image-scalebar') : null;
+  if (!bar) {
+    return;
+  }
+  var umPerPx = parseFloat(img.dataset.umPerPx);
+  var scroller = img.closest('.zoom-scroll');
+  if (!umPerPx || !scroller) {
+    bar.style.display = 'none';
+    return;
+  }
+
+  var umPerCssPx = umPerPx / (noriCurrentZoom(img) / 100);
+  var viewportPx = scroller.clientWidth;
+  var targetUm = viewportPx * 0.18 * umPerCssPx;
+
+  var lengthUm = NORI_SCALEBAR_NICE_UM[NORI_SCALEBAR_NICE_UM.length - 1];
+  for (var i = 0; i < NORI_SCALEBAR_NICE_UM.length; i++) {
+    if (NORI_SCALEBAR_NICE_UM[i] >= targetUm) {
+      lengthUm = NORI_SCALEBAR_NICE_UM[i];
+      break;
+    }
+  }
+  var barPx = lengthUm / umPerCssPx;
+
+  if (barPx < 2 || barPx > viewportPx * 0.9) {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  bar.querySelector('.image-scalebar-track').style.width = barPx + 'px';
+  bar.querySelector('.image-scalebar-label').textContent = lengthUm + ' µm';
+}
+
+// Zoom percentage that fits the whole (natural-size) image to the full width of its
+// .zoom-scroll viewport (scaling up past 100% for images narrower than the viewport,
+// not just down for wider ones) — height is left to scroll, it's not a fit constraint.
 function noriFitZoomPct(img) {
   var scroller = img.closest('.zoom-scroll');
   var naturalWidth = img.naturalWidth;
-  var naturalHeight = img.naturalHeight;
-  if (!scroller || !naturalWidth || !naturalHeight) {
+  if (!scroller || !naturalWidth) {
     return 100;
   }
-  var fitScale = Math.min(
-    scroller.clientWidth / naturalWidth,
-    scroller.clientHeight / naturalHeight,
-  );
-  var pct = Math.round(Math.min(fitScale * 100, 100));
+  var pct = Math.round((scroller.clientWidth / naturalWidth) * 100);
   return Math.min(Math.max(pct, NORI_ZOOM_MIN), NORI_ZOOM_MAX);
 }
 
@@ -341,21 +384,40 @@ function noriUpdatePolygonDraft(wrap, points, cursor) {
 // --- finalized (saved) regions ---
 
 // Creates (or recreates, e.g. when switching back to an image with existing regions)
-// the finalized, numbered, percentage-positioned shape for one region.
+// the finalized, numbered, percentage-positioned shape for one region. 'tubule'
+// regions only carry a single click point (their actual pixel-mask shape is only known
+// server-side, from the 'tubules' channel), so they get a small dot marker instead of
+// an outline.
 function noriCreateRegionShape(wrap, id, region) {
   var svg = noriOverlaySvgFor(wrap);
   var color = NORI_REGION_COLORS[(id - 1) % NORI_REGION_COLORS.length];
-  var points = region.type === 'polygon' ? region.points : noriRectCorners(region.points);
+  var minX, minY;
 
-  var shape = document.createElementNS(NORI_SVG_NS, 'polygon');
-  shape.setAttribute('class', 'region-shape region-final-shape');
-  shape.setAttribute('points', noriPointsAttr(points));
-  shape.setAttribute('data-region-id', String(id));
-  shape.style.stroke = color;
-  svg.appendChild(shape);
+  if (region.type === 'tubule') {
+    var p = region.points[0];
+    var marker = document.createElementNS(NORI_SVG_NS, 'circle');
+    marker.setAttribute('class', 'region-shape region-final-shape region-tubule-marker');
+    marker.setAttribute('cx', p.x * 100);
+    marker.setAttribute('cy', p.y * 100);
+    marker.setAttribute('r', 1.2);
+    marker.setAttribute('data-region-id', String(id));
+    marker.style.stroke = color;
+    marker.style.fill = color;
+    svg.appendChild(marker);
+    minX = p.x;
+    minY = p.y;
+  } else {
+    var points = region.type === 'polygon' ? region.points : noriRectCorners(region.points);
+    var shape = document.createElementNS(NORI_SVG_NS, 'polygon');
+    shape.setAttribute('class', 'region-shape region-final-shape');
+    shape.setAttribute('points', noriPointsAttr(points));
+    shape.setAttribute('data-region-id', String(id));
+    shape.style.stroke = color;
+    svg.appendChild(shape);
+    minX = Math.min.apply(null, points.map(function (pt) { return pt.x; }));
+    minY = Math.min.apply(null, points.map(function (pt) { return pt.y; }));
+  }
 
-  var minX = Math.min.apply(null, points.map(function (p) { return p.x; }));
-  var minY = Math.min.apply(null, points.map(function (p) { return p.y; }));
   var badge = document.createElement('span');
   badge.className = 'region-badge';
   badge.dataset.regionId = String(id);
@@ -446,17 +508,46 @@ function noriSetRegionMode(mode) {
     polyBtn.classList.toggle('btn-outline', !polyActive);
     polyBtn.textContent = polyActive ? 'Polygon (dbl-click to finish)' : 'Polygon';
   }
+  var tubuleBtn = document.getElementById('viewer-select-tubule-button');
+  if (tubuleBtn) {
+    var tubuleActive = noriRegionState.mode === 'tubule';
+    tubuleBtn.classList.toggle('btn-primary', tubuleActive);
+    tubuleBtn.classList.toggle('btn-outline', !tubuleActive);
+    tubuleBtn.textContent = tubuleActive ? 'Tubule (click to stop)' : 'Tubule';
+  }
 
   document.querySelectorAll('.zoom-scroll').forEach(function (scroller) {
     scroller.classList.toggle('region-select-active', !!noriRegionState.mode);
   });
 }
 
+// Tubule: a single click selects the whole region (no drag/multi-vertex); the actual
+// pixel mask is resolved server-side from the 'tubules' channel (see
+// region_bbox_and_mask in app.py) since the browser never sees raw channel data.
+document.addEventListener('click', function (event) {
+  if (noriRegionState.mode !== 'tubule') {
+    return;
+  }
+  var wrap = event.target.closest('.zoom-image-wrap');
+  if (!wrap) {
+    return;
+  }
+  var pt = noriWrapFraction(wrap, event.clientX, event.clientY);
+  var id = noriRegionState.nextId++;
+  var imgEl = wrap.querySelector('.zoom-image');
+  var region = { id: id, type: 'tubule', points: [pt], imagePath: (imgEl && imgEl.dataset.imagePath) || '' };
+  noriCreateRegionShape(wrap, id, region);
+  noriRegionState.regions.push(region);
+  noriPublishRegions();
+});
+
 document.addEventListener('click', function (event) {
   if (event.target.closest('#viewer-select-rect-button')) {
     noriSetRegionMode('rect');
   } else if (event.target.closest('#viewer-select-polygon-button')) {
     noriSetRegionMode('polygon');
+  } else if (event.target.closest('#viewer-select-tubule-button')) {
+    noriSetRegionMode('tubule');
   }
 });
 
