@@ -669,16 +669,46 @@ def table_with_toolbar(table, filename):
 
 # --- figure building ------------------------------------------------------
 
-def build_attention_boxplots(umap_df):
+ATTENTION_PREDICTED_N_GROUPS = 10
+
+
+def build_attention_boxplots(umap_df, group_by='target'):
+    """group_by='target' (default) groups by the discrete class_name (target) bucket, as
+    before. group_by='predicted' groups instead by the model's own continuous
+    `prediction` column, with outliers excluded (IQR rule, same as
+    build_pred_age_trend_plot) and the remaining range split into
+    ATTENTION_PREDICTED_N_GROUPS equal-width groups (each row assigned to its group's
+    center) — a raw prediction has too many distinct values for a readable boxplot."""
+    if group_by == 'predicted':
+        plot_df = umap_df.assign(prediction=pd.to_numeric(umap_df['prediction'], errors='coerce'))
+        plot_df = plot_df.dropna(subset=['prediction'])
+        label = f'Predicted {target_label(umap_df).lower()}'
+
+        if not plot_df.empty:
+            lower, upper = _iqr_bounds(plot_df['prediction'].values)
+            plot_df = plot_df[(plot_df['prediction'] >= lower) & (plot_df['prediction'] <= upper)]
+
+        if not plot_df.empty:
+            pred_min, pred_max = plot_df['prediction'].min(), plot_df['prediction'].max()
+            bin_width = (pred_max - pred_min) / ATTENTION_PREDICTED_N_GROUPS if pred_max > pred_min else 1.0
+            bin_idx = np.minimum(
+                ((plot_df['prediction'] - pred_min) / bin_width).astype(int), ATTENTION_PREDICTED_N_GROUPS - 1,
+            )
+            plot_df = plot_df.assign(attn_group=pred_min + (bin_idx + 0.5) * bin_width)
+        group_col = 'attn_group'
+    else:
+        group_col = 'class_name'
+        plot_df = umap_df
+        label = target_label(umap_df)
+
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    order = sorted(umap_df['class_name'].dropna().unique().tolist(), key=float)
+    order = sorted(plot_df[group_col].dropna().unique().tolist(), key=float)
     order_labels = [format_class_name(v) for v in order]
-    label = target_label(umap_df)
-    plot_df = umap_df.assign(class_name=umap_df['class_name'].apply(format_class_name))
+    plot_df = plot_df.assign(**{group_col: plot_df[group_col].apply(format_class_name)})
 
     sns.boxplot(
-        data=plot_df, x='class_name', y='protein_attn', hue='class_name', order=order_labels,
+        data=plot_df, x=group_col, y='protein_attn', hue=group_col, order=order_labels,
         hue_order=order_labels, palette='viridis', dodge=False, legend=False, ax=axes[0],
     )
     axes[0].set_title(f'Protein attention by {label.lower()}')
@@ -686,7 +716,7 @@ def build_attention_boxplots(umap_df):
     axes[0].grid(True)
 
     sns.boxplot(
-        data=plot_df, x='class_name', y='lipid_attn', hue='class_name', order=order_labels,
+        data=plot_df, x=group_col, y='lipid_attn', hue=group_col, order=order_labels,
         hue_order=order_labels, palette='viridis', dodge=False, legend=False, ax=axes[1],
     )
     axes[1].set_title(f'Lipid attention by {label.lower()}')
@@ -2921,6 +2951,18 @@ def umap_explorer_page_layout(base_dir, group, task):
 
         html.Div(className='card', children=[
             html.Div('Attention scores by aging group', className='card-title'),
+            html.Div([
+                html.Label('Group by', className='field-label', style={'margin': 0}),
+                dcc.RadioItems(
+                    id='attn-group-mode',
+                    className='inline-checklist',
+                    options=[
+                        {'label': 'Target value', 'value': 'target'},
+                        {'label': 'Predicted value (10 groups, outliers excluded)', 'value': 'predicted'},
+                    ],
+                    value='target',
+                ),
+            ], style={'display': 'flex', 'alignItems': 'center', 'gap': '10px', 'marginBottom': '10px'}),
             plot_with_toolbar(html.Img(id='attn-boxplots-img', className='boxplot-img'), 'attention_boxplots'),
         ]),
 
@@ -4818,9 +4860,10 @@ def register_callbacks(app, default_base_dir):
         Input('explorer-show-button', 'n_clicks'),
         State('explorer-model-dropdown', 'value'),
         State('explorer-context-store', 'data'),
+        State('attn-group-mode', 'value'),
         prevent_initial_call=True,
     )
-    def update_umap(n_clicks, model_name, context):
+    def update_umap(n_clicks, model_name, context, attn_group_mode):
         if not (n_clicks and context and model_name):
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
@@ -4834,7 +4877,7 @@ def register_callbacks(app, default_base_dir):
         fig = build_umap_figure(umap_df, group, task, model_name)
 
         try:
-            attn_boxplots_src = build_attention_boxplots(umap_df)
+            attn_boxplots_src = build_attention_boxplots(umap_df, group_by=attn_group_mode or 'target')
         except Exception:
             attn_boxplots_src = None
 
@@ -4853,8 +4896,26 @@ def register_callbacks(app, default_base_dir):
             'records': umap_df.to_dict('records'),
             'max_p': max_p,
             'max_l': max_l,
+            'target_col': umap_df.attrs.get('target_col'),
         }
         return store_data, metrics_text, fig, attn_boxplots_src
+
+    @app.callback(
+        Output('attn-boxplots-img', 'src', allow_duplicate=True),
+        Input('attn-group-mode', 'value'),
+        State('umap-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_attention_boxplots_mode(attn_group_mode, store_data):
+        if not store_data or not store_data.get('records'):
+            return dash.no_update
+
+        umap_df = pd.DataFrame(store_data['records'])
+        umap_df.attrs['target_col'] = store_data.get('target_col')
+        try:
+            return build_attention_boxplots(umap_df, group_by=attn_group_mode or 'target')
+        except Exception:
+            return dash.no_update
 
     @app.callback(
         Output('image-panel-output', 'children'),
