@@ -69,11 +69,17 @@ for the whole-image overlay and image viewer, `data/`:
 │           │   ├── epoch_loss_<model_name>.*        # e.g. loss_<model>.png
 │           │   ├── mae_<model_name>.*
 │           │   └── r2_<model_name>.*
+│           ├── saved_images/                 # auto-created cache of "All model plots" page
+│           │   └── <plot_name>.png                  # images (UMAP/density/prediction/combined
+│           │                                        #   plots); reused on later loads, and
+│           │                                        #   auto-rebuilt if their source umap/*.csv
+│           │                                        #   is newer than the cached file
 │           └── features/                     # optional, for the "Features" page
 │               ├── tubule_features.csv              # tubule-level features, every sample
 │               ├── nuclei_features.csv               # per-nucleus features, every sample
 │               ├── shape_features.csv                # per-tubule shape features, every sample
-│               └── nori_protein_explorer.html        # optional, opened by the "NORI + Proteomics" button
+│               ├── nori_protein_explorer.html        # optional, opened by the "NORI + Proteomics explorer" button
+│               └── nori_metabolite_explorer.html      # optional, opened by the "NORI + metabolomics explorer" button
 └── data/
     └── <group>/
         └── <class_name>/
@@ -111,15 +117,24 @@ as before. Edits take effect on the next page load / group selection — no rest
 - **Main page** — set the data folder, pick a group / task, and jump to any of the pages
   below. Also has an "About this model" explainer (what the multimodal model is, how the
   protein/lipid/optional fluorescent-marker inputs are fused, what its outputs mean) with a collapsible gallery of
-  every reference diagram from the model-explanation deck. The "NORI + Proteomics" button
-  opens `outputs/<group>/<task>/features/nori_protein_explorer.html` in a new tab.
+  every reference diagram from the model-explanation deck. The "NORI + Proteomics explorer"
+  button opens `outputs/<group>/<task>/features/nori_protein_explorer.html` in a new tab,
+  and the "NORI + metabolomics explorer" button opens
+  `outputs/<group>/<task>/features/nori_metabolite_explorer.html` in a new tab.
 - **UMAP explorer** ("Show UMAP") — pick a model, view its UMAP scatter plot, regression
   metrics (MAE, R²) and attention-score boxplots by age; click a point to inspect its tile
-  heatmap.
+  heatmap. When the attention boxplots are grouped by **predicted value**, a histogram of
+  all predicted values (outliers included, with the IQR outlier cutoffs marked) is shown
+  below them.
 - **All model plots** ("Show all model plots") — side-by-side UMAP, density, and
   prediction plots (plus training curves) for every model in a task, with a combined
   prediction-by-sample boxplot, an animal-level distribution-separation plot, and a
-  median-predicted-age-by-animal plot.
+  median-predicted-age-by-animal plot. Every generated plot on this page is cached to
+  `outputs/<group>/<task>/saved_images/` the first time it's built and reused on later
+  page loads instead of being re-generated — the cache auto-invalidates (and the plot is
+  rebuilt) if its source `umap/<model_name>.csv` file(s) have been modified since the
+  cached image was saved, so you don't need to manually clear it after re-running a
+  model; delete a file there (or the whole folder) to force a rebuild for any other reason.
 - **Whole-image prediction overlay** ("Show prediction map") — pick a model and a
   whole-slide `.tif`, and view it with per-tile predictions overlaid as a heatmap. Supports
   click-to-zoom, and an "Inspect tile" mode that looks up and shows that tile's per-model

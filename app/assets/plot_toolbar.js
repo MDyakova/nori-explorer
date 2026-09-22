@@ -13,26 +13,38 @@ function noriFlashButton(btn, symbol) {
   setTimeout(function () { btn.textContent = original; }, 1200);
 }
 
+// Writes to the clipboard synchronously (within the click handler's call stack) with a
+// Promise<Blob> as the ClipboardItem value, rather than awaiting the blob first and
+// calling clipboard.write() afterwards. Browsers (Safari in particular, and
+// increasingly Chrome) require clipboard writes to happen within the original user
+// gesture; awaiting a fetch/toBlob before calling write() loses that "user activation"
+// window and the write silently rejects even on a genuine button click.
+function noriWriteImageBlobToClipboard(blobPromise, btn) {
+  try {
+    navigator.clipboard.write([new ClipboardItem({ 'image/png': blobPromise })])
+      .then(function () { noriFlashButton(btn, '✓'); })
+      .catch(function () { noriFlashButton(btn, '✗'); });
+  } catch (err) {
+    noriFlashButton(btn, '✗');
+  }
+}
+
 function noriCopyImage(dataUri, btn) {
-  fetch(dataUri)
-    .then(function (res) { return res.blob(); })
-    .then(function (blob) {
-      return navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-    })
-    .then(function () { noriFlashButton(btn, '✓'); })
-    .catch(function () { noriFlashButton(btn, '✗'); });
+  var blobPromise = fetch(dataUri).then(function (res) { return res.blob(); });
+  noriWriteImageBlobToClipboard(blobPromise, btn);
 }
 
 function noriCopyCanvas(canvas, btn) {
-  canvas.toBlob(function (blob) {
-    if (!blob) {
-      noriFlashButton(btn, '✗');
-      return;
-    }
-    navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
-      .then(function () { noriFlashButton(btn, '✓'); })
-      .catch(function () { noriFlashButton(btn, '✗'); });
+  var blobPromise = new Promise(function (resolve, reject) {
+    canvas.toBlob(function (blob) {
+      if (blob) {
+        resolve(blob);
+      } else {
+        reject(new Error('canvas.toBlob returned null'));
+      }
+    });
   });
+  noriWriteImageBlobToClipboard(blobPromise, btn);
 }
 
 // For a zoomed/scrolled .zoom-image, render only the crop currently visible in its
