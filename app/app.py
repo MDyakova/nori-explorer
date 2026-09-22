@@ -399,6 +399,7 @@ def features_dir_path(base_dir, group, task):
 
 
 NORI_PROTEIN_EXPLORER_FILENAME = 'nori_protein_explorer.html'
+NORI_METABOLITE_EXPLORER_FILENAME = 'nori_metabolite_explorer.html'
 
 
 def nori_protein_explorer_path(base_dir, group, task):
@@ -408,6 +409,18 @@ def nori_protein_explorer_path(base_dir, group, task):
         return None
     outputs_root = os.path.realpath(os.path.join(base_dir, 'outputs'))
     path = os.path.realpath(os.path.join(features_dir_path(base_dir, group, task), NORI_PROTEIN_EXPLORER_FILENAME))
+    if os.path.commonpath([outputs_root, path]) != outputs_root or not os.path.isfile(path):
+        return None
+    return path
+
+
+def nori_metabolite_explorer_path(base_dir, group, task):
+    """Path to outputs/<group>/<task>/features/nori_metabolite_explorer.html, or None if
+    the file is missing or group/task point outside <base_dir>/outputs."""
+    if not (base_dir and group and task and is_valid_base_dir(base_dir)):
+        return None
+    outputs_root = os.path.realpath(os.path.join(base_dir, 'outputs'))
+    path = os.path.realpath(os.path.join(features_dir_path(base_dir, group, task), NORI_METABOLITE_EXPLORER_FILENAME))
     if os.path.commonpath([outputs_root, path]) != outputs_root or not os.path.isfile(path):
         return None
     return path
@@ -631,6 +644,41 @@ def pil_to_data_uri(img):
     return f'data:image/png;base64,{encoded}'
 
 
+def saved_images_dir_path(base_dir, group, task):
+    return os.path.join(base_dir, 'outputs', group, task, 'saved_images')
+
+
+def umap_csv_path(base_dir, group, task, model_name):
+    return os.path.join(base_dir, 'outputs', group, task, 'umap', f'{model_name}.csv')
+
+
+def cached_plot_data_uri(base_dir, group, task, filename, build_fn, source_paths=()):
+    """Returns a data:image/png;base64 URI for `filename`, reusing a PNG already saved
+    under outputs/<group>/<task>/saved_images/ instead of re-generating it — but only if
+    it's still at least as new as every path in `source_paths` (the table(s) the plot is
+    built from, e.g. the model's umap.csv). If any source file has been modified since
+    the cached image was saved, the cache is treated as stale and rebuilt. On a cache
+    miss/stale cache, calls build_fn() (which must return such a data URI) and saves its
+    bytes there so later page loads can reuse it; saving is best-effort and never blocks
+    returning the freshly generated image."""
+    save_path = os.path.join(saved_images_dir_path(base_dir, group, task), f'{filename}.png')
+
+    if os.path.isfile(save_path):
+        cached_mtime = os.path.getmtime(save_path)
+        if all(os.path.isfile(p) and os.path.getmtime(p) <= cached_mtime for p in source_paths):
+            return pil_to_data_uri(Image.open(save_path))
+
+    data_uri = build_fn()
+    try:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        _, encoded = data_uri.split(',', 1)
+        with open(save_path, 'wb') as f:
+            f.write(base64.b64decode(encoded))
+    except Exception:
+        pass
+    return data_uri
+
+
 def plot_with_toolbar(img, filename):
     """Wrap a static plot html.Img with hover copy/download icon buttons."""
     return html.Div(className='plot-wrap', children=[
@@ -678,11 +726,16 @@ def build_attention_boxplots(umap_df, group_by='target'):
     `prediction` column, with outliers excluded (IQR rule, same as
     build_pred_age_trend_plot) and the remaining range split into
     ATTENTION_PREDICTED_N_GROUPS equal-width groups (each row assigned to its group's
-    center) — a raw prediction has too many distinct values for a readable boxplot."""
+    center) — a raw prediction has too many distinct values for a readable boxplot. In
+    this mode a histogram of *all* predicted values (outliers included, with the outlier
+    cutoffs marked) is drawn below the two boxplots."""
+    all_predictions = None
     if group_by == 'predicted':
         plot_df = umap_df.assign(prediction=pd.to_numeric(umap_df['prediction'], errors='coerce'))
         plot_df = plot_df.dropna(subset=['prediction'])
         label = f'Predicted {target_label(umap_df).lower()}'
+        all_predictions = plot_df['prediction'].values
+        lower = upper = None
 
         if not plot_df.empty:
             lower, upper = _iqr_bounds(plot_df['prediction'].values)
@@ -701,7 +754,14 @@ def build_attention_boxplots(umap_df, group_by='target'):
         plot_df = umap_df
         label = target_label(umap_df)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    if all_predictions is not None:
+        fig = plt.figure(figsize=(10, 6.5))
+        grid = fig.add_gridspec(2, 2, height_ratios=[4, 2.5])
+        axes = [fig.add_subplot(grid[0, 0]), fig.add_subplot(grid[0, 1])]
+        hist_ax = fig.add_subplot(grid[1, :])
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        hist_ax = None
 
     order = sorted(plot_df[group_col].dropna().unique().tolist(), key=float)
     order_labels = [format_class_name(v) for v in order]
@@ -722,6 +782,17 @@ def build_attention_boxplots(umap_df, group_by='target'):
     axes[1].set_title(f'Lipid attention by {label.lower()}')
     axes[1].set_xlabel(label)
     axes[1].grid(True)
+
+    if hist_ax is not None and len(all_predictions):
+        hist_ax.hist(all_predictions, bins=50, color=sns.color_palette('viridis', 1)[0], edgecolor='white')
+        if np.isfinite(lower):
+            hist_ax.axvline(lower, color='crimson', linestyle='--', linewidth=1, label='Outlier cutoffs (IQR)')
+            hist_ax.axvline(upper, color='crimson', linestyle='--', linewidth=1)
+            hist_ax.legend(fontsize=8)
+        hist_ax.set_title(f'Distribution of all {label.lower()} values (n={len(all_predictions):,})')
+        hist_ax.set_xlabel(label)
+        hist_ax.set_ylabel('Count')
+        hist_ax.grid(True)
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -2792,10 +2863,14 @@ def main_page_layout(default_base_dir):
                 ]),
             ]),
             html.Div(className='btn-group', children=[
-                html.Div('NORI + Proteomics', className='btn-group-label'),
+                html.Div('NORI + Proteomics/Metabolomics', className='btn-group-label'),
                 html.Div(className='btn-secondary', style={'display': 'flex', 'gap': '10px'}, children=[
                     html.A(
                         'NORI + Proteomics explorer', id='nori-protein-link', href='#', target='_blank',
+                        className='btn-primary',
+                    ),
+                    html.A(
+                        'NORI + metabolomics explorer', id='nori-metabolite-link', href='#', target='_blank',
                         className='btn-primary',
                     ),
                 ]),
@@ -3005,15 +3080,25 @@ def build_model_card(base_dir, group, task, model_name):
 
     try:
         umap_df = load_umap_df(base_dir, group, task, model_name)
-        img_src = build_static_umap_image(umap_df, model_name)
+        source_paths = [umap_csv_path(base_dir, group, task, model_name)]
+        img_src = cached_plot_data_uri(
+            base_dir, group, task, f'{model_name}_umap',
+            lambda: build_static_umap_image(umap_df, model_name), source_paths,
+        )
         children.append(plot_with_toolbar(
             html.Img(src=img_src, className='umap-card-img'), f'{model_name}_umap',
         ))
-        kde_src = build_static_umap_kde_image(umap_df, model_name)
+        kde_src = cached_plot_data_uri(
+            base_dir, group, task, f'{model_name}_umap_density',
+            lambda: build_static_umap_kde_image(umap_df, model_name), source_paths,
+        )
         children.append(plot_with_toolbar(
             html.Img(src=kde_src, className='umap-card-img umap-card-kde'), f'{model_name}_umap_density',
         ))
-        prediction_src = build_static_umap_prediction_image(umap_df, model_name)
+        prediction_src = cached_plot_data_uri(
+            base_dir, group, task, f'{model_name}_umap_prediction',
+            lambda: build_static_umap_prediction_image(umap_df, model_name), source_paths,
+        )
         children.append(plot_with_toolbar(
             html.Img(src=prediction_src, className='umap-card-img umap-card-kde'), f'{model_name}_umap_prediction',
         ))
@@ -3096,9 +3181,13 @@ def all_umaps_page_layout(base_dir, group, task):
     if model_names:
         _target_col, _ = load_target_info(base_dir, group, task)
         _target_lbl = _target_col.replace('_', ' ').strip().title() or 'Target'
+        _all_umap_csv_paths = [umap_csv_path(base_dir, group, task, m) for m in model_names]
 
         try:
-            combined_src = build_combined_prediction_boxplot(base_dir, group, task, model_names)
+            combined_src = cached_plot_data_uri(
+                base_dir, group, task, 'predictions_by_target_and_sample',
+                lambda: build_combined_prediction_boxplot(base_dir, group, task, model_names), _all_umap_csv_paths,
+            )
         except Exception:
             combined_src = None
             combined_error = traceback.format_exc()
@@ -3114,7 +3203,10 @@ def all_umaps_page_layout(base_dir, group, task):
         ]))
 
         try:
-            animal_level_src = build_animal_level_separation_plot(base_dir, group, task, model_names)
+            animal_level_src = cached_plot_data_uri(
+                base_dir, group, task, 'animal_level_separation',
+                lambda: build_animal_level_separation_plot(base_dir, group, task, model_names), _all_umap_csv_paths,
+            )
         except Exception:
             animal_level_src = None
             animal_level_error = traceback.format_exc()
@@ -3130,7 +3222,10 @@ def all_umaps_page_layout(base_dir, group, task):
         ]))
 
         try:
-            age_trend_src = build_animal_median_age_trend_plot(base_dir, group, task, model_names)
+            age_trend_src = cached_plot_data_uri(
+                base_dir, group, task, 'median_predicted_target_by_animal',
+                lambda: build_animal_median_age_trend_plot(base_dir, group, task, model_names), _all_umap_csv_paths,
+            )
         except Exception:
             age_trend_src = None
             age_trend_error = traceback.format_exc()
@@ -3164,7 +3259,7 @@ def features_page_layout(base_dir, group, task):
                 html.A('← Back to explorer', href='/', className='btn-outline'),
                 html.Div(className='top-links-group', children=[
                     html.A(
-                        'Feature dictionary ↗', href='/assets/md_files/nori_kidney_feature_dictionary.html', target='_blank',
+                        'Feature dictionary ↗', href='/assets/md_files/NoRI_morphology_feature_dictionary.html', target='_blank',
                         className='btn-outline',
                     ),
                     html.A(
@@ -3224,7 +3319,7 @@ def features_page_layout(base_dir, group, task):
             html.A('← Back to explorer', href='/', className='btn-outline'),
             html.Div(className='top-links-group', children=[
                 html.A(
-                    'Feature dictionary ↗', href='/assets/md_files/nori_kidney_feature_dictionary.html', target='_blank',
+                    'Feature dictionary ↗', href='/assets/md_files/NoRI_morphology_feature_dictionary.html', target='_blank',
                     className='btn-outline',
                 ),
                 html.A(
@@ -3917,6 +4012,17 @@ def create_app(default_base_dir=None):
             )
         return flask.send_file(path, mimetype='text/html')
 
+    @app.server.route('/nori-metabolite-explorer')
+    def serve_nori_metabolite_explorer():
+        params = flask.request.args
+        path = nori_metabolite_explorer_path(params.get('base_dir', ''), params.get('group', ''), params.get('task', ''))
+        if path is None:
+            return (
+                f'{NORI_METABOLITE_EXPLORER_FILENAME} not found in outputs/&lt;group&gt;/&lt;task&gt;/features/ '
+                'for this selection.', 404,
+            )
+        return flask.send_file(path, mimetype='text/html')
+
     app.layout = html.Div([
         dcc.Location(id='url', refresh=False),
         html.Div(id='page-content'),
@@ -4025,6 +4131,18 @@ def register_callbacks(app, default_base_dir):
             return '#'
         query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
         return f'/nori-protein-explorer?{query}'
+
+    @app.callback(
+        Output('nori-metabolite-link', 'href'),
+        Input('base-dir-store', 'data'),
+        Input('group-dropdown', 'value'),
+        Input('task-dropdown', 'value'),
+    )
+    def update_nori_metabolite_link(base_dir, group, task):
+        if not (base_dir and group and task):
+            return '#'
+        query = urlencode({'base_dir': base_dir, 'group': group, 'task': task})
+        return f'/nori-metabolite-explorer?{query}'
 
     @app.callback(
         Output('statistics-link', 'href'),

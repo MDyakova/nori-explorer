@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>NoRI Kidney Morphology Feature Dictionary</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">NoRI Kidney Morphology Feature Dictionary</h1>
+</header>
+<p><strong>Definitions • formulas • interpretation • low/high
+examples</strong></p>
+<p><strong>Scope.</strong> This document explains the requested
+NoRI-derived morphology and intensity features. For the newer
+shape/polarity features, formulas and definitions are taken from the
+supplied notebook compute_tubule_aging_features implementation. The
+notebook supplied here does not contain the implementation of several
+legacy features (for example tb_size, protein_delta, black_holes,
+area_n). For those, the formula below is an operational interpretation
+based on the feature name and the masks/channels used in this project;
+these entries are explicitly marked “implementation not present in
+supplied notebook” and should be checked against the older extraction
+code before publication.</p>
+<h1 id="notation">Notation</h1>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Symbol</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>T</td>
+<td>tubule mask</td>
+</tr>
+<tr class="even">
+<td>L</td>
+<td>lumen mask</td>
+</tr>
+<tr class="odd">
+<td>E = T \ L</td>
+<td>epithelial mask</td>
+</tr>
+<tr class="even">
+<td>B</td>
+<td>brush-border mask</td>
+</tr>
+<tr class="odd">
+<td>N</td>
+<td>nuclear mask</td>
+</tr>
+<tr class="even">
+<td>NC</td>
+<td>nucleolus mask</td>
+</tr>
+<tr class="odd">
+<td>P(x)</td>
+<td>protein-channel intensity at pixel x</td>
+</tr>
+<tr class="even">
+<td>D(x)</td>
+<td>lipid-channel intensity at pixel x</td>
+</tr>
+<tr class="odd">
+<td>A(M)</td>
+<td>area / number of pixels in mask M</td>
+</tr>
+<tr class="even">
+<td>mean(X|M)</td>
+<td>mean X within mask M</td>
+</tr>
+<tr class="odd">
+<td>CV</td>
+<td>standard deviation / |mean|</td>
+</tr>
+<tr class="even">
+<td>Hull(M)</td>
+<td>convex hull of mask M</td>
+</tr>
+</tbody>
+</table>
+<h1 id="basic-size-and-intensity-features">1. Basic size and intensity
+features</h1>
+<h2 id="tb_size-implementation-not-present-in-supplied-notebook">tb_size
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Size of the segmented tubule.</p>
+<p><strong>Formula:</strong> tb_size = A(T). If physical calibration is
+applied: A(T) × pixel_area.</p>
+<p><strong>Example:</strong> Low value — small tubule cross-section |
+High value — large tubule cross-section</p>
+<p><strong>Biological / morphological interpretation:</strong> Primarily
+reflects tubule cross-sectional size; compare only after consistent
+segmentation and scale.</p>
+<h2
+id="protein_level-implementation-not-present-in-supplied-notebook">protein_level
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Average protein-channel signal in
+the analyzed tubule/region.</p>
+<p><strong>Formula:</strong> protein_level = mean(P | T) (or the
+project-specific analysis mask).</p>
+<p><strong>Example:</strong> Low value — weak mean protein signal | High
+value — strong mean protein signal</p>
+<p><strong>Biological / morphological interpretation:</strong> Reflects
+average protein-rich material, not a specific protein.</p>
+<h2
+id="lipid_level-implementation-not-present-in-supplied-notebook">lipid_level
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Average lipid-channel signal in
+the analyzed tubule/region.</p>
+<p><strong>Formula:</strong> lipid_level = mean(D | T) (or the
+project-specific analysis mask).</p>
+<p><strong>Example:</strong> Low value — weak mean lipid signal | High
+value — strong mean lipid signal</p>
+<p><strong>Biological / morphological interpretation:</strong> Reflects
+average lipid-rich signal.</p>
+<h2
+id="protein_level_nuclei-implementation-not-present-in-supplied-notebook">protein_level_nuclei
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean protein signal inside
+nuclei.</p>
+<p><strong>Formula:</strong> protein_level_nuclei = mean(P | N).</p>
+<p><strong>Example:</strong> Low value — protein-poor nuclei | High
+value — protein-rich nuclei</p>
+<p><strong>Biological / morphological interpretation:</strong> Measures
+nuclear protein-channel intensity.</p>
+<h2
+id="protein_level_around_nuclei-implementation-not-present-in-supplied-notebook">protein_level_around_nuclei
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean protein signal in a
+perinuclear ring around nuclei.</p>
+<p><strong>Formula:</strong> protein_level_around_nuclei = mean(P |
+perinuclear ring).</p>
+<p><strong>Example:</strong> Low value — weak perinuclear protein | High
+value — strong perinuclear protein</p>
+<p><strong>Biological / morphological interpretation:</strong> Sensitive
+to how the perinuclear ring is constructed.</p>
+<h2
+id="lipid_level_around_nuclei-implementation-not-present-in-supplied-notebook">lipid_level_around_nuclei
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean lipid signal in a perinuclear
+ring around nuclei.</p>
+<p><strong>Formula:</strong> lipid_level_around_nuclei = mean(D |
+perinuclear ring).</p>
+<p><strong>Example:</strong> Low value — weak perinuclear lipid | High
+value — strong perinuclear lipid</p>
+<p><strong>Biological / morphological interpretation:</strong> Can
+reflect lipid enrichment around cells/nuclei.</p>
+<h2
+id="protein_level_lumen-implementation-not-present-in-supplied-notebook">protein_level_lumen
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean protein-channel intensity
+inside the lumen.</p>
+<p><strong>Formula:</strong> protein_level_lumen = mean(P | L).</p>
+<p><strong>Example:</strong> Low value — clear/protein-poor lumen | High
+value — protein-rich lumen</p>
+<p><strong>Biological / morphological interpretation:</strong> High
+values may indicate luminal proteinaceous material, but interpretation
+depends on image quality and segmentation.</p>
+<h2
+id="lipid_level_lumen-implementation-not-present-in-supplied-notebook">lipid_level_lumen
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean lipid-channel intensity
+inside the lumen.</p>
+<p><strong>Formula:</strong> lipid_level_lumen = mean(D | L).</p>
+<p><strong>Example:</strong> Low value — lipid-poor lumen | High value —
+lipid-rich lumen</p>
+<p><strong>Biological / morphological interpretation:</strong> Measures
+lipid-like signal within the lumen.</p>
+<h2
+id="lumen_size-implementation-not-present-in-supplied-notebook">lumen_size
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Area of the segmented lumen.</p>
+<p><strong>Formula:</strong> lumen_size = A(L).</p>
+<p><strong>Example:</strong> Low value — narrow/small lumen | High value
+— large/dilated lumen</p>
+<p><strong>Biological / morphological interpretation:</strong> Can
+reflect lumen dilation or narrowing; absolute size also depends on
+tubule size.</p>
+<h2
+id="protein_level_bb-implementation-not-present-in-supplied-notebook">protein_level_bb
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean protein signal within the
+brush-border mask.</p>
+<p><strong>Formula:</strong> protein_level_bb = mean(P | B).</p>
+<p><strong>Example:</strong> Low value — weak brush-border protein |
+High value — strong brush-border protein</p>
+<p><strong>Biological / morphological interpretation:</strong> Useful
+mainly for proximal tubules with a recognizable brush border.</p>
+<h2
+id="lipid_level_bb-implementation-not-present-in-supplied-notebook">lipid_level_bb
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean lipid signal within the
+brush-border mask.</p>
+<p><strong>Formula:</strong> lipid_level_bb = mean(D | B).</p>
+<p><strong>Example:</strong> Low value — weak brush-border lipid | High
+value — strong brush-border lipid</p>
+<p><strong>Biological / morphological interpretation:</strong> Describes
+lipid-channel intensity in the brush-border region.</p>
+<h2 id="bb_size-implementation-not-present-in-supplied-notebook">bb_size
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Area of segmented brush
+border.</p>
+<p><strong>Formula:</strong> bb_size = A(B).</p>
+<p><strong>Example:</strong> Low value — little brush-border area | High
+value — large brush-border area</p>
+<p><strong>Biological / morphological interpretation:</strong> Absolute
+brush-border amount; unlike brush_fraction it is not normalized to
+epithelium size.</p>
+<h2
+id="protein_level_tb_conn-implementation-not-present-in-supplied-notebook">protein_level_tb_conn
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean protein signal in the
+tubule-connection / inter-tubule connection mask used by the legacy
+pipeline.</p>
+<p><strong>Formula:</strong> protein_level_tb_conn = mean(P |
+TB_conn).</p>
+<p><strong>Example:</strong> Low value — weak signal | High value —
+strong signal</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+biological meaning depends on the legacy TB_conn mask definition.</p>
+<h2
+id="lipid_level_tb_conn-implementation-not-present-in-supplied-notebook">lipid_level_tb_conn
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean lipid signal in the
+tubule-connection / inter-tubule connection mask used by the legacy
+pipeline.</p>
+<p><strong>Formula:</strong> lipid_level_tb_conn = mean(D |
+TB_conn).</p>
+<p><strong>Example:</strong> Low value — weak signal | High value —
+strong signal</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+biological meaning depends on the legacy TB_conn mask definition.</p>
+<h2
+id="tb_conn_size-implementation-not-present-in-supplied-notebook">tb_conn_size
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Area of the legacy
+tubule-connection mask.</p>
+<p><strong>Formula:</strong> tb_conn_size = A(TB_conn).</p>
+<p><strong>Example:</strong> Low value — small connection region | High
+value — large connection region</p>
+<p><strong>Biological / morphological interpretation:</strong> Requires
+the original TB_conn segmentation definition.</p>
+<h2
+id="black_holes-implementation-not-present-in-supplied-notebook">black_holes
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Amount or fraction of very
+low-signal holes inside the analyzed tissue/tubule mask.</p>
+<p><strong>Formula:</strong> Typical operational form: A(low-signal
+holes) / A(reference mask), or count of such holes.</p>
+<p><strong>Example:</strong> Low value — few/small dark voids | High
+value — many/large dark voids</p>
+<p><strong>Biological / morphological interpretation:</strong> Could
+represent true low-signal spaces, vacuoles, lumen-like spaces, or
+imaging/segmentation artifacts depending on implementation.</p>
+<h2
+id="nuclei_number-implementation-not-present-in-supplied-notebook">nuclei_number
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Number of segmented nuclei in the
+region/tubule.</p>
+<p><strong>Formula:</strong> nuclei_number = count(connected nuclear
+objects).</p>
+<p><strong>Example:</strong> Low value — few nuclei | High value — many
+nuclei</p>
+<p><strong>Biological / morphological interpretation:</strong> Raw count
+depends strongly on tubule/ROI size; a density can be more
+comparable.</p>
+<h2
+id="nuclei_area_mean-implementation-not-present-in-supplied-notebook">nuclei_area_mean
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Mean area of segmented nuclei.</p>
+<p><strong>Formula:</strong> nuclei_area_mean = (Σ A(N_i)) /
+n_nuclei.</p>
+<p><strong>Example:</strong> Low value — small nuclei on average | High
+value — large nuclei on average</p>
+<p><strong>Biological / morphological interpretation:</strong> Can
+capture nuclear enlargement/shrinkage, but is
+segmentation-sensitive.</p>
+<h2
+id="nucleolus_number_in_nuclei-implementation-not-present-in-supplied-notebook">nucleolus_number_in_nuclei
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Number of detected nucleoli within
+nuclei, often averaged or summed per ROI.</p>
+<p><strong>Formula:</strong> Typical: Σ_i count(NC inside N_i), or mean
+count per nucleus.</p>
+<p><strong>Example:</strong> Low value — few nucleoli | High value —
+many nucleoli</p>
+<p><strong>Biological / morphological interpretation:</strong> Confirm
+whether the original code stores total or mean per nucleus.</p>
+<h2
+id="nucleolus_area_in_nuclei-implementation-not-present-in-supplied-notebook">nucleolus_area_in_nuclei
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Area occupied by nucleoli inside
+nuclei, often total or normalized.</p>
+<p><strong>Formula:</strong> Typical: Σ A(NC ∩ N), optionally /
+A(N).</p>
+<p><strong>Example:</strong> Low value — small nucleolar area | High
+value — large nucleolar area</p>
+<p><strong>Biological / morphological interpretation:</strong> Confirm
+normalization in the legacy extractor.</p>
+<h2
+id="protein_delta-implementation-not-present-in-supplied-notebook">protein_delta
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Protein intensity contrast between
+two project-defined compartments.</p>
+<p><strong>Formula:</strong> Typical: mean(P | region 1) − mean(P |
+region 2).</p>
+<p><strong>Example:</strong> Low value — small/near-zero contrast | High
+value — large positive or negative contrast</p>
+<p><strong>Biological / morphological interpretation:</strong> The exact
+two regions must be recovered from the legacy code before mechanistic
+interpretation.</p>
+<h2
+id="lipid_delta-implementation-not-present-in-supplied-notebook">lipid_delta
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Lipid intensity contrast between
+two project-defined compartments.</p>
+<p><strong>Formula:</strong> Typical: mean(D | region 1) − mean(D |
+region 2).</p>
+<p><strong>Example:</strong> Low value — small/near-zero contrast | High
+value — large positive or negative contrast</p>
+<p><strong>Biological / morphological interpretation:</strong> The exact
+two regions must be recovered from the legacy code.</p>
+<h2
+id="lipid_droplet_size-implementation-not-present-in-supplied-notebook">lipid_droplet_size
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Typical size of segmented lipid
+droplets.</p>
+<p><strong>Formula:</strong> Typical: mean or median A(LD_i) across
+lipid-droplet objects.</p>
+<p><strong>Example:</strong> Low value — small droplets | High value —
+large droplets</p>
+<p><strong>Biological / morphological interpretation:</strong>
+Distinguishes droplet enlargement from simply having more lipid
+signal.</p>
+<h2
+id="body_size-implementation-not-present-in-supplied-notebook">body_size
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Area of the legacy cell/tubule
+body mask.</p>
+<p><strong>Formula:</strong> body_size = A(body mask).</p>
+<p><strong>Example:</strong> Low value — small body region | High value
+— large body region</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+mask definition is needed for publication.</p>
+<h2
+id="lipid_droplet_level-implementation-not-present-in-supplied-notebook">lipid_droplet_level
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Amount/intensity of lipid-droplet
+signal.</p>
+<p><strong>Formula:</strong> Typical: mean(D | LD) and/or
+A(LD)/A(reference mask).</p>
+<p><strong>Example:</strong> Low value — few/weak droplets | High value
+— abundant/intense droplets</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+implementation determines whether this is intensity, fraction, or
+both.</p>
+<h2
+id="bb_size_k-implementation-not-present-in-supplied-notebook">bb_size_k
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Normalized brush-border size.</p>
+<p><strong>Formula:</strong> Likely bb_size_k = A(B) / A(reference
+compartment), commonly tubule or epithelial area.</p>
+<p><strong>Example:</strong> Low value — small brush-border fraction |
+High value — large brush-border fraction</p>
+<p><strong>Biological / morphological interpretation:</strong> Check the
+denominator in the legacy code.</p>
+<h2
+id="lumen_size_k-implementation-not-present-in-supplied-notebook">lumen_size_k
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Normalized lumen size.</p>
+<p><strong>Formula:</strong> Likely lumen_size_k = A(L) / A(reference
+compartment), commonly A(T).</p>
+<p><strong>Example:</strong> Low value — small lumen fraction | High
+value — large lumen fraction</p>
+<p><strong>Biological / morphological interpretation:</strong> If
+denominator is tubule area, this is conceptually lumen fraction.</p>
+<h2 id="area_n-implementation-not-present-in-supplied-notebook">area_n
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Nuclear area measure in the legacy
+pipeline.</p>
+<p><strong>Formula:</strong> Typical: A(N), ΣA(N_i), or A(N)/A(reference
+mask).</p>
+<p><strong>Example:</strong> Low value — low nuclear area | High value —
+high nuclear area</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+aggregation/normalization is not available in the supplied notebook.</p>
+<h2
+id="nucleolus-implementation-not-present-in-supplied-notebook">nucleolus
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Legacy nucleolus feature.</p>
+<p><strong>Formula:</strong> Typical: count or area of nucleoli detected
+within nuclei.</p>
+<p><strong>Example:</strong> Low value — few/small nucleoli | High value
+— many/large nucleoli</p>
+<p><strong>Biological / morphological interpretation:</strong> The
+original extractor is required to distinguish count from
+area/intensity.</p>
+<h2 id="area_nc-implementation-not-present-in-supplied-notebook">area_nc
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Legacy
+nucleolus/nuclear-compartment area feature.</p>
+<p><strong>Formula:</strong> Typical: A(NC), ΣA(NC_i), or a normalized
+nucleolar area.</p>
+<p><strong>Example:</strong> Low value — low value | High value — high
+value</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+definition is not recoverable from the supplied notebook.</p>
+<h2
+id="robust_cv_protein-implementation-not-present-in-supplied-notebook">robust_cv_protein
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Robust measure of spatial
+heterogeneity of protein intensity.</p>
+<p><strong>Formula:</strong> Typical robust CV = robust_scale(P) /
+|robust_center(P)|; often MAD-based rather than SD-based.</p>
+<p><strong>Example:</strong> Low value — uniform protein signal | High
+value — heterogeneous/patchy protein signal</p>
+<p><strong>Biological / morphological interpretation:</strong> Unlike
+ordinary CV, robust CV reduces sensitivity to extreme pixels; exact
+robust estimator should be confirmed.</p>
+<h2
+id="robust_cv_lipid-implementation-not-present-in-supplied-notebook">robust_cv_lipid
+<em>[implementation not present in supplied notebook]</em></h2>
+<p><strong>What it measures:</strong> Robust measure of spatial
+heterogeneity of lipid intensity.</p>
+<p><strong>Formula:</strong> Typical robust CV = robust_scale(D) /
+|robust_center(D)|; often MAD-based rather than SD-based.</p>
+<p><strong>Example:</strong> Low value — uniform lipid signal | High
+value — heterogeneous/patchy lipid signal</p>
+<p><strong>Biological / morphological interpretation:</strong> Exact
+robust estimator should be confirmed.</p>
+<h1 id="brush-border-integrity-features">2. Brush-border integrity
+features</h1>
+<h2
+id="brush_border_coverage-exact-notebook-implementation">brush_border_coverage
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Fraction of the lumen-facing
+epithelial boundary covered by brush border.</p>
+<p><strong>Formula:</strong> coverage = A(B ∩ lumen-facing boundary) /
+A(lumen-facing boundary).</p>
+<p><strong>Example:</strong> Low value — ≈0: almost no boundary coverage
+| High value — ≈1: nearly continuous boundary coverage</p>
+<p><strong>Biological / morphological interpretation:</strong> Higher
+values indicate more complete brush-border coverage along the
+lumen-facing surface.</p>
+<h2 id="brush_fraction-exact-notebook-implementation">brush_fraction
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Fraction of total epithelial area
+occupied by brush border.</p>
+<p><strong>Formula:</strong> brush_fraction = A(B) / A(E).</p>
+<p><strong>Example:</strong> Low value — 0.05: little epithelium
+classified as brush border | High value — 0.30: substantial brush-border
+area</p>
+<p><strong>Biological / morphological interpretation:</strong> Measures
+relative brush-border amount, normalized to epithelial size.</p>
+<h2
+id="brush_fragmentation-exact-notebook-implementation">brush_fragmentation
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Number of valid connected
+brush-border components per 1000 lumen-boundary pixels.</p>
+<p><strong>Formula:</strong> fragmentation = N_valid_components /
+A(lumen-facing boundary) × 1000.</p>
+<p><strong>Example:</strong> Low value — low: continuous/few components
+| High value — high: many separate fragments</p>
+<p><strong>Biological / morphological interpretation:</strong> Higher
+values indicate a more fragmented brush-border pattern.</p>
+<h2
+id="largest_brush_component_fraction-exact-notebook-implementation">largest_brush_component_fraction
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Fraction of brush-border boundary
+pixels belonging to the largest connected brush-border component.</p>
+<p><strong>Formula:</strong> largest_fraction = max(component size) /
+A(brush on lumen boundary).</p>
+<p><strong>Example:</strong> Low value — low: brush border split among
+many fragments | High value — high, near 1: one dominant continuous
+component</p>
+<p><strong>Biological / morphological interpretation:</strong> High
+values suggest continuity; low values suggest fragmentation.</p>
+<h2 id="brush_thickness-exact-notebook-implementation">brush_thickness
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Median local thickness of the
+brush-border mask.</p>
+<p><strong>Formula:</strong> thickness = median(2 ×
+distance_transform(B)[B]); multiplied by pixel_size_um when
+supplied.</p>
+<p><strong>Example:</strong> Low value — small: thin brush border | High
+value — large: thick brush border</p>
+<p><strong>Biological / morphological interpretation:</strong> Measures
+geometric thickness, not signal intensity.</p>
+<h1 id="apicalbasal-polarity-and-radial-signal-organization">3.
+Apical–basal polarity and radial signal organization</h1>
+<h2
+id="protein_apical_basal_ratio-exact-notebook-implementation">protein_apical_basal_ratio
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Protein enrichment near the
+lumen-facing (apical) epithelium relative to the outer (basal)
+epithelium.</p>
+<p><strong>Formula:</strong> protein_apical_basal_ratio = mean(P |
+apical zone) / mean(P | basal zone).</p>
+<p><strong>Example:</strong> Low value — &lt;1: more basal protein
+signal | High value — &gt;1: more apical protein signal</p>
+<p><strong>Biological / morphological interpretation:</strong> 1 means
+similar apical and basal mean signal.</p>
+<h2
+id="lipid_apical_basal_ratio-exact-notebook-implementation">lipid_apical_basal_ratio
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Lipid enrichment near the apical
+epithelium relative to the basal epithelium.</p>
+<p><strong>Formula:</strong> lipid_apical_basal_ratio = mean(D | apical
+zone) / mean(D | basal zone).</p>
+<p><strong>Example:</strong> Low value — &lt;1: more basal lipid signal
+| High value — &gt;1: more apical lipid signal</p>
+<p><strong>Biological / morphological interpretation:</strong>
+Quantifies epithelial lipid polarity.</p>
+<h2
+id="protein_radial_gradient-exact-notebook-implementation">protein_radial_gradient
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Monotonic change in mean protein
+intensity from apical (0) to basal (1) position.</p>
+<p><strong>Formula:</strong> Spearman ρ(radial-bin center, protein
+radial profile).</p>
+<p><strong>Example:</strong> Low value — negative: protein tends to
+decrease toward basal side | High value — positive: protein tends to
+increase toward basal side</p>
+<p><strong>Biological / morphological interpretation:</strong> Near 0
+means little monotonic apical→basal trend; magnitude reflects strength
+of monotonic organization.</p>
+<h2
+id="lipid_radial_gradient-exact-notebook-implementation">lipid_radial_gradient
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Monotonic change in mean lipid
+intensity from apical (0) to basal (1) position.</p>
+<p><strong>Formula:</strong> Spearman ρ(radial-bin center, lipid radial
+profile).</p>
+<p><strong>Example:</strong> Low value — negative: lipid decreases
+toward basal side | High value — positive: lipid increases toward basal
+side</p>
+<p><strong>Biological / morphological interpretation:</strong> Near 0
+means weak monotonic radial organization.</p>
+<h2
+id="protein_lipid_radial_correlation-exact-notebook-implementation">protein_lipid_radial_correlation
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Similarity between protein and
+lipid radial profiles across the epithelium.</p>
+<p><strong>Formula:</strong> Spearman ρ(protein radial profile, lipid
+radial profile).</p>
+<p><strong>Example:</strong> Low value — ≈−1: opposite radial
+organization | High value — ≈+1: matching radial organization</p>
+<p><strong>Biological / morphological interpretation:</strong> Near 0
+indicates little monotonic correspondence between the two radial
+profiles.</p>
+<h1 id="lumen-and-tubule-shape-features">4. Lumen and tubule shape
+features</h1>
+<h2
+id="radial_roughness_cv-exact-notebook-implementation">radial_roughness_cv
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Variability of lumen radius as a
+function of angle around its center.</p>
+<p><strong>Formula:</strong> radial_roughness_cv = SD(r_lumen(θ)) /
+|mean(r_lumen(θ))| after angular binning/interpolation.</p>
+<p><strong>Example:</strong> Low value — near 0: smooth, regular lumen |
+High value — high: uneven/irregular lumen boundary</p>
+<p><strong>Biological / morphological interpretation:</strong>
+Scale-normalized boundary roughness; this feature is computed on the
+lumen.</p>
+<h2
+id="concavity_fraction-exact-notebook-implementation">concavity_fraction
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Fraction of the lumen's convex
+hull not occupied by the lumen itself.</p>
+<p><strong>Formula:</strong> concavity_fraction = [A(Hull(L)) − A(L)] /
+A(Hull(L)) = 1 − lumen solidity.</p>
+<p><strong>Example:</strong> Low value — 0.02: almost convex/smooth
+lumen | High value — 0.35: strongly indented lumen</p>
+<p><strong>Biological / morphological interpretation:</strong> Higher
+values mean stronger inward indentations and deviation from a convex
+lumen shape.</p>
+<h2
+id="tubule_radial_roughness_cv-exact-notebook-implementation">tubule_radial_roughness_cv
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Variability of the outer tubule
+radius across angles.</p>
+<p><strong>Formula:</strong> tubule_radial_roughness_cv =
+SD(r_tubule(θ)) / |mean(r_tubule(θ))|.</p>
+<p><strong>Example:</strong> Low value — near 0: smooth outer contour |
+High value — high: irregular/wavy outer contour</p>
+<p><strong>Biological / morphological interpretation:</strong> Captures
+outer-boundary irregularity independently of absolute tubule size.</p>
+<h2
+id="tubule_concavity_fraction-exact-notebook-implementation">tubule_concavity_fraction
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Fraction of the tubule convex hull
+not occupied by the tubule.</p>
+<p><strong>Formula:</strong> tubule_concavity_fraction = [A(Hull(T)) −
+A(T)] / A(Hull(T)) = 1 − tubule_solidity.</p>
+<p><strong>Example:</strong> Low value — 0.02: nearly convex tubule |
+High value — 0.35: deeply indented/irregular tubule</p>
+<p><strong>Biological / morphological interpretation:</strong> Higher
+values indicate greater concavity of the outer tubule shape.</p>
+<h2 id="tubule_solidity-exact-notebook-implementation">tubule_solidity
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Fraction of the convex hull
+occupied by the tubule.</p>
+<p><strong>Formula:</strong> tubule_solidity = A(T) / A(Hull(T)).</p>
+<p><strong>Example:</strong> Low value — low: irregular/concave tubule |
+High value — near 1: compact, convex tubule</p>
+<p><strong>Biological / morphological interpretation:</strong> In this
+implementation, tubule_solidity = 1 − tubule_concavity_fraction, so the
+two contain the same information in opposite directions.</p>
+<h2
+id="epithelial_thickness_cv-exact-notebook-implementation">epithelial_thickness_cv
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Relative variability of epithelial
+thickness around the lumen-facing epithelium.</p>
+<p><strong>Formula:</strong> epithelial_thickness_cv = SD(thickness
+values) / |mean(thickness values)|, where thickness ≈
+distance_from_lumen + distance_from_outer.</p>
+<p><strong>Example:</strong> Low value — near 0: uniform epithelial
+thickness | High value — high: strongly variable epithelial
+thickness</p>
+<p><strong>Biological / morphological interpretation:</strong> Higher
+values indicate heterogeneous thinning/thickening around the tubule.</p>
+<h2
+id="tubule_eccentricity-exact-notebook-implementation">tubule_eccentricity
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Elongation of the segmented
+tubule, using region eccentricity.</p>
+<p><strong>Formula:</strong> eccentricity = focal_distance /
+major_axis_length (regionprops definition), ranging approximately
+0–1.</p>
+<p><strong>Example:</strong> Low value — ≈0: round tubule | High value —
+closer to 1: elongated tubule</p>
+<p><strong>Biological / morphological interpretation:</strong> Measures
+elongation, not boundary roughness.</p>
+<h2
+id="tubule_perimeter_area_ratio-exact-notebook-implementation">tubule_perimeter_area_ratio
+<em>[exact notebook implementation]</em></h2>
+<p><strong>What it measures:</strong> Outer tubule perimeter relative to
+tubule area.</p>
+<p><strong>Formula:</strong> tubule_perimeter_area_ratio = perimeter(T)
+/ A(T).</p>
+<p><strong>Example:</strong> Low value — low: compact/smooth and/or
+large object | High value — high: more boundary per unit area</p>
+<p><strong>Biological / morphological interpretation:</strong> Can
+increase with irregularity, fragmentation of contour, or smaller scale;
+interpret with size and resolution.</p>
+<h1 id="how-to-read-the-features-together">5. How to read the features
+together</h1>
+<p><strong>Brush-border loss pattern:</strong> lower
+brush_border_coverage, lower brush_fraction, lower
+largest_brush_component_fraction, and higher brush_fragmentation
+together support loss/disruption more strongly than any single
+feature.</p>
+<p><strong>Lumen distortion pattern:</strong> higher radial_roughness_cv
+and concavity_fraction indicate a less regular lumen; lumen_size or
+lumen_size_k adds information about dilation/constriction.</p>
+<p><strong>Tubule distortion pattern:</strong> higher
+tubule_radial_roughness_cv, higher tubule_concavity_fraction, lower
+tubule_solidity, and often higher perimeter/area ratio describe
+increasingly irregular outer geometry.</p>
+<p><strong>Polarity remodeling:</strong> apical/basal ratios and radial
+gradients indicate where protein/lipid signal is redistributed across
+the epithelial thickness, while protein_lipid_radial_correlation asks
+whether both channels reorganize in the same radial pattern.</p>
+<h1 id="important-implementation-note">Important implementation
+note</h1>
+<p>The newer 18-feature block is directly supported by the supplied
+notebook. Several legacy variables appear only in the user's requested
+feature list and are not implemented in that notebook. Their entries
+above are therefore intentionally labeled as operational interpretations
+rather than exact code definitions. For a manuscript or grant methods
+section, the older feature-extraction notebook/script should be checked
+so the precise masks, thresholds, normalization denominators, and
+aggregation rules can be inserted.</p>
+</body>
+</html>
