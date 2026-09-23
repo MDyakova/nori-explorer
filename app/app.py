@@ -162,7 +162,8 @@ def target_name_txt_path(base_dir, group, task):
 def load_target_info(base_dir, group, task):
     """Read outputs/<group>/<task>/target_name.txt - one line, 'name:dtype' (e.g.
     'age:float', or a protein-expression column such as 'clathrin_hc:float') -
-    identifying which umap.csv column is this model's regression target. Falls back to
+    identifying which umap.csv column is this model's regression target. Split on the
+    last ':' since the name itself may contain colons. Falls back to
     ('age', 'float'), the original hardcoded target, when the file is missing or
     unparsable so older output folders keep working unchanged."""
     path = target_name_txt_path(base_dir, group, task)
@@ -170,7 +171,7 @@ def load_target_info(base_dir, group, task):
         with open(path, encoding='utf-8-sig') as f:
             line = f.readline().strip()
         if ':' in line:
-            name, dtype = line.split(':', 1)
+            name, dtype = line.rsplit(':', 1)
             name = name.strip()
             if name:
                 return name, dtype.strip().lower()
