@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -642,11 +643,60 @@ def list_pred_age_trend_features(base_dir, group, task, kind=None, pred_col='pre
 
 # --- image helpers ------------------------------------------------------
 
+# Resolution of every downloadable plot: matplotlib figures are rendered at this dpi
+# (the page shrinks them to fit via CSS), and every PNG served to the browser is tagged
+# with it so a downloaded image opens at publication print size.
+EXPORT_DPI = 300
+
+# Grad-CAM tile heatmaps are small fixed-size image files; their download is upscaled
+# in the browser by HEATMAP_EXPORT_DPI / EXPORT_DPI (keeping the same printed size as
+# other images) and tagged with this dpi.
+HEATMAP_EXPORT_DPI = 1000
+
+# Plotly's "Download plot as png" button renders at CSS-pixel size (96 per inch); this
+# scale brings that up to EXPORT_DPI.
+PLOTLY_EXPORT_SCALE = EXPORT_DPI / 96
+
+
+def export_filename(*parts):
+    """Download filename (without extension) built from the page's current context —
+    e.g. export_filename(group, task, model, 'umap') -> 'kidney_age_resnet_umap'. Empty
+    parts are skipped, and anything that isn't a letter, digit, '.' or '-' is replaced so
+    the name is safe on every OS."""
+    cleaned = []
+    for part in parts:
+        if part is None or part == '':
+            continue
+        text = re.sub(r'[^\w.-]+', '-', str(part)).strip('-_.')
+        if text:
+            cleaned.append(text)
+    return '_'.join(cleaned)[:180] or 'plot'
+
+
+def image_stem(rel_image_path):
+    """'data/sub/kidney_01.tif' -> 'kidney_01', for use in download filenames."""
+    return os.path.splitext(os.path.basename(str(rel_image_path)))[0]
+
+
+def filter_filename_part(filter_col, filter_val):
+    """'filter-<col>-<val>' when a feature filter is active, else None."""
+    if filter_col and filter_val not in (None, '', []):
+        vals = filter_val if isinstance(filter_val, (list, tuple)) else [filter_val]
+        return f'filter-{filter_col}-' + '-'.join(str(v) for v in vals)
+    return None
+
+
+def plotly_export_config(filename):
+    """dcc.Graph config so the modebar camera button saves a EXPORT_DPI png as `filename`."""
+    return {'toImageButtonOptions': {'format': 'png', 'filename': filename, 'scale': PLOTLY_EXPORT_SCALE}}
+
+
 def pil_to_data_uri(img, compress_level=6):
-    """PNG data URI for a PIL image. compress_level 1 (still lossless) encodes large
-    images several times faster than the default 6 for a slightly bigger file."""
+    """PNG data URI for a PIL image, tagged as EXPORT_DPI. compress_level 1 (still
+    lossless) encodes large images several times faster than the default 6 for a
+    slightly bigger file."""
     buf = io.BytesIO()
-    img.save(buf, format='PNG', compress_level=compress_level)
+    img.save(buf, format='PNG', compress_level=compress_level, dpi=(EXPORT_DPI, EXPORT_DPI))
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
 
@@ -673,7 +723,10 @@ def cached_plot_data_uri(base_dir, group, task, filename, build_fn, source_paths
     if os.path.isfile(save_path):
         cached_mtime = os.path.getmtime(save_path)
         if all(os.path.isfile(p) and os.path.getmtime(p) <= cached_mtime for p in source_paths):
-            return pil_to_data_uri(Image.open(save_path))
+            cached_img = Image.open(save_path)
+            # Images saved before plots were rendered at EXPORT_DPI are rebuilt.
+            if round(cached_img.info.get('dpi', (0, 0))[0]) >= EXPORT_DPI:
+                return pil_to_data_uri(cached_img)
 
     data_uri = build_fn()
     try:
@@ -686,8 +739,15 @@ def cached_plot_data_uri(base_dir, group, task, filename, build_fn, source_paths
     return data_uri
 
 
-def plot_with_toolbar(img, filename):
-    """Wrap a static plot html.Img with hover copy/download icon buttons."""
+def attention_boxplots_filename(group, task, model_name, group_by):
+    return export_filename(group, task, model_name, 'attention_boxplots', f'by-{group_by or "target"}')
+
+
+def plot_with_toolbar(img, filename, export_dpi=EXPORT_DPI):
+    """Wrap a static plot html.Img with hover copy/download icon buttons. `filename` is
+    the download name; for an image whose plot changes via callbacks, the callback can
+    instead set the img's own 'data-filename', which the download button prefers. An
+    export_dpi above EXPORT_DPI makes the download upscale the image to match it."""
     return html.Div(className='plot-wrap', children=[
         img,
         html.Div(className='plot-toolbar', children=[
@@ -697,7 +757,7 @@ def plot_with_toolbar(img, filename):
             ),
             html.Button(
                 '⬇', title='Download image', className='plot-icon-btn plot-download-btn',
-                **{'data-filename': filename},
+                **{'data-filename': filename, 'data-export-dpi': str(export_dpi)},
             ),
         ]),
     ])
@@ -803,7 +863,7 @@ def build_attention_boxplots(umap_df, group_by='target'):
 
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=120)
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI)
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -830,7 +890,7 @@ def build_static_umap_image(umap_df, model_name):
 
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -855,7 +915,7 @@ def build_static_umap_kde_image(umap_df, model_name):
 
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -881,7 +941,7 @@ def build_static_umap_prediction_image(umap_df, model_name):
     ax.grid(alpha=0.3)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -936,7 +996,7 @@ def build_combined_prediction_boxplot(base_dir, group, task, model_names):
     ax.grid(True)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -1093,7 +1153,7 @@ def build_animal_level_separation_plot(base_dir, group, task, model_names):
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -1159,7 +1219,7 @@ def build_animal_median_age_trend_plot(base_dir, group, task, model_names):
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -1424,7 +1484,7 @@ def build_feature_box_or_violin_plot(df, x_col, y_col, hue_col=None, plot_type='
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -1479,7 +1539,7 @@ def build_pred_age_trend_plot(df, feature_col, pred_col='prediction', bin_width=
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}', rho, p_value
@@ -1775,7 +1835,7 @@ def build_stats_ranked_bar_plot(
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -1815,7 +1875,7 @@ def build_stats_volcano_plot(
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -1884,7 +1944,7 @@ def build_pairwise_effect_size_heatmap(results_df, top_n=50, label='target'):
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
@@ -3006,7 +3066,7 @@ def build_combined_distribution_plot(region_results, kind='kde', max_points_per_
     ax.set_title(subtitle, fontsize=10)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
     return Image.open(buf).convert('RGB')
@@ -3044,7 +3104,7 @@ def build_region_boxplot(region_results):
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=EXPORT_DPI, bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
     return Image.open(buf).convert('RGB')
@@ -3375,7 +3435,7 @@ def umap_explorer_page_layout(base_dir, group, task):
 
         html.Div(className='card', children=[
             html.Div('UMAP embedding', className='card-title'),
-            dcc.Graph(id='umap-scatter'),
+            dcc.Graph(id='umap-scatter', config=plotly_export_config('umap_interactive')),
         ]),
 
         html.Div(className='card', children=[
@@ -3418,21 +3478,23 @@ def build_model_card(base_dir, group, task, model_name):
             lambda: build_static_umap_image(umap_df, model_name), source_paths,
         )
         children.append(plot_with_toolbar(
-            html.Img(src=img_src, className='umap-card-img'), f'{model_name}_umap',
+            html.Img(src=img_src, className='umap-card-img'), export_filename(group, task, model_name, 'umap'),
         ))
         kde_src = cached_plot_data_uri(
             base_dir, group, task, f'{model_name}_umap_density',
             lambda: build_static_umap_kde_image(umap_df, model_name), source_paths,
         )
         children.append(plot_with_toolbar(
-            html.Img(src=kde_src, className='umap-card-img umap-card-kde'), f'{model_name}_umap_density',
+            html.Img(src=kde_src, className='umap-card-img umap-card-kde'),
+            export_filename(group, task, model_name, 'umap_density'),
         ))
         prediction_src = cached_plot_data_uri(
             base_dir, group, task, f'{model_name}_umap_prediction',
             lambda: build_static_umap_prediction_image(umap_df, model_name), source_paths,
         )
         children.append(plot_with_toolbar(
-            html.Img(src=prediction_src, className='umap-card-img umap-card-kde'), f'{model_name}_umap_prediction',
+            html.Img(src=prediction_src, className='umap-card-img umap-card-kde'),
+            export_filename(group, task, model_name, 'umap_prediction'),
         ))
     except Exception:
         children.append(html.Pre(traceback.format_exc(), className='metrics-box'))
@@ -3448,7 +3510,10 @@ def build_model_card(base_dir, group, task, model_name):
             continue
         training_imgs.append(html.Div(className='training-img-wrap', children=[
             html.Div(label, className='training-img-label'),
-            plot_with_toolbar(html.Img(src=data_uri, className='training-img'), f'{prefix}_{model_name}'),
+            plot_with_toolbar(
+                html.Img(src=data_uri, className='training-img'),
+                export_filename(group, task, model_name, 'training', prefix),
+            ),
         ]))
 
     if training_imgs:
@@ -3529,7 +3594,8 @@ def all_umaps_page_layout(base_dir, group, task):
         combined_section.append(html.Div(className='card', children=[
             html.Div(f'Predictions by {_target_lbl.lower()} and sample (all models combined)', className='card-title'),
             plot_with_toolbar(
-                html.Img(src=combined_src, className='umap-card-img umap-card-img-75'), 'predictions_by_target_and_sample',
+                html.Img(src=combined_src, className='umap-card-img umap-card-img-75'),
+                export_filename(group, task, 'all_models', 'predictions_by_target_and_sample'),
             ) if combined_src
             else html.Pre(combined_error or 'No data available.', className='metrics-box'),
         ]))
@@ -3548,7 +3614,8 @@ def all_umaps_page_layout(base_dir, group, task):
         combined_section.append(html.Div(className='card', children=[
             html.Div(f'Animal-level distribution separation by {_target_lbl.lower()} transition', className='card-title'),
             plot_with_toolbar(
-                html.Img(src=animal_level_src, className='umap-card-img umap-card-img-75'), 'animal_level_separation',
+                html.Img(src=animal_level_src, className='umap-card-img umap-card-img-75'),
+                export_filename(group, task, 'all_models', 'animal_level_separation'),
             ) if animal_level_src
             else html.Pre(animal_level_error or 'No data available.', className='metrics-box'),
         ]))
@@ -3567,7 +3634,8 @@ def all_umaps_page_layout(base_dir, group, task):
         combined_section.append(html.Div(className='card', children=[
             html.Div(f'Median predicted {_target_lbl.lower()} by animal (dots colored by model)', className='card-title'),
             plot_with_toolbar(
-                html.Img(src=age_trend_src, className='umap-card-img umap-card-img-75'), 'median_predicted_target_by_animal',
+                html.Img(src=age_trend_src, className='umap-card-img umap-card-img-75'),
+                export_filename(group, task, 'all_models', 'median_predicted_target_by_animal'),
             ) if age_trend_src
             else html.Pre(age_trend_error or 'No data available.', className='metrics-box'),
         ]))
@@ -3723,7 +3791,7 @@ def features_page_layout(base_dir, group, task):
                 className='btn-primary', style={'marginTop': '10px'},
             ),
             html.Div(id='features-scatter-status', className='status-text', style={'marginTop': '10px'}),
-            dcc.Graph(id='features-scatter-graph'),
+            dcc.Graph(id='features-scatter-graph', config=plotly_export_config('features_scatter')),
         ]),
 
         html.Div(className='card', children=[
@@ -4124,7 +4192,7 @@ def whole_image_overlay_page_layout(base_dir, group, task, model=''):
                 ]),
                 plot_with_toolbar(
                     html.Img(id='tile-heatmap-img', className='tile-image', style={'marginTop': '10px'}),
-                    'tile_heatmap',
+                    'tile_heatmap', export_dpi=HEATMAP_EXPORT_DPI,
                 ),
             ]),
         ]),
@@ -4647,6 +4715,117 @@ def register_callbacks(app, default_base_dir):
             return html.Span('No rows with values for the selected columns.', className='status-error'), go.Figure()
         return html.Span(f'{len(df)} row(s) loaded.', className='status-ok'), fig
 
+    # Download filenames for the Features page plots, set from the same button click and
+    # dropdown values that build each plot so the name always describes what's shown.
+    @app.callback(
+        Output('features-scatter-graph', 'config'),
+        Input('features-scatter-button', 'n_clicks'),
+        State('features-kind-dropdown', 'value'),
+        State('features-agg-dropdown', 'value'),
+        State('scatter-x-dropdown', 'value'),
+        State('scatter-y-dropdown', 'value'),
+        State('scatter-hue-dropdown', 'value'),
+        State('features-filter-col-dropdown', 'value'),
+        State('features-filter-val-dropdown', 'value'),
+        State('features-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_features_scatter_filename(n_clicks, kind, level, x_col, y_col, hue_col, filter_col, filter_val, context):
+        if not (n_clicks and context):
+            return dash.no_update
+        return plotly_export_config(export_filename(
+            context['group'], context['task'], kind, level or 'tubule', 'scatter', f'{y_col}_vs_{x_col}',
+            f'hue-{hue_col}' if hue_col else None, filter_filename_part(filter_col, filter_val),
+        ))
+
+    @app.callback(
+        Output('features-box-img', 'data-filename'),
+        Input('features-box-button', 'n_clicks'),
+        State('features-kind-dropdown', 'value'),
+        State('features-agg-dropdown', 'value'),
+        State('box-plot-type-dropdown', 'value'),
+        State('box-x-dropdown', 'value'),
+        State('box-y-dropdown', 'value'),
+        State('box-hue-dropdown', 'value'),
+        State('features-filter-col-dropdown', 'value'),
+        State('features-filter-val-dropdown', 'value'),
+        State('features-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_features_box_filename(n_clicks, kind, level, plot_type, x_col, y_col, hue_col, filter_col, filter_val, context):
+        if not (n_clicks and context):
+            return dash.no_update
+        return export_filename(
+            context['group'], context['task'], kind, level or 'tubule', plot_type or 'box', f'{y_col}_by_{x_col}',
+            f'hue-{hue_col}' if hue_col else None, filter_filename_part(filter_col, filter_val),
+        )
+
+    @app.callback(
+        Output('pred-trend-img', 'data-filename'),
+        Input('pred-trend-button', 'n_clicks'),
+        State('pred-trend-feature-dropdown', 'value'),
+        State('features-kind-dropdown', 'value'),
+        State('features-agg-dropdown', 'value'),
+        State('features-filter-col-dropdown', 'value'),
+        State('features-filter-val-dropdown', 'value'),
+        State('features-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_pred_trend_filename(n_clicks, feature, kind, level, filter_col, filter_val, context):
+        if not (n_clicks and context):
+            return dash.no_update
+        return export_filename(
+            context['group'], context['task'], kind, level or 'tubule', 'predicted_trend', feature,
+            filter_filename_part(filter_col, filter_val),
+        )
+
+    # Same for the Statistics page plots.
+    @app.callback(
+        Output('stats-overall-ranked-img', 'data-filename'),
+        Output('stats-overall-volcano-img', 'data-filename'),
+        Output('stats-pairwise-heatmap-img', 'data-filename'),
+        Output('stats-pairwise-ranked-img', 'data-filename'),
+        Output('stats-pairwise-volcano-img', 'data-filename'),
+        Input('stats-run-button', 'n_clicks'),
+        State('stats-kind-dropdown', 'value'),
+        State('stats-agg-dropdown', 'value'),
+        State('stats-filter-col-dropdown', 'value'),
+        State('stats-filter-val-dropdown', 'value'),
+        State('stats-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_feature_stats_filenames(n_clicks, kind, level, filter_col, filter_val, context):
+        if not (n_clicks and context):
+            return (dash.no_update,) * 5
+        prefix = (
+            context['group'], context['task'], 'stats', kind, level or 'animal_median',
+            filter_filename_part(filter_col, filter_val),
+        )
+        return tuple(
+            export_filename(*prefix, name)
+            for name in ('overall_ranked_features', 'overall_volcano',
+                         'pairwise_effect_size_heatmap', 'pairwise_ranked_features', 'pairwise_volcano')
+        )
+
+    @app.callback(
+        Output('stats-inspect-img', 'data-filename'),
+        Input('stats-inspect-button', 'n_clicks'),
+        State('stats-inspect-dropdown', 'value'),
+        State('stats-inspect-type-dropdown', 'value'),
+        State('stats-results-store', 'data'),
+        State('stats-context-store', 'data'),
+        prevent_initial_call=True,
+    )
+    def update_stats_inspect_filename(n_clicks, feature, plot_type, results_meta, context):
+        if not (n_clicks and results_meta and context):
+            return dash.no_update
+        return export_filename(
+            context['group'], context['task'], 'stats', results_meta.get('kind'),
+            results_meta.get('level', 'animal_median'),
+            filter_filename_part(results_meta.get('filter_col'), results_meta.get('filter_val')),
+            plot_type or 'box', f'{feature}_by_class_name',
+        )
+
     @app.callback(
         Output('features-tile-panel', 'children'),
         Input('features-scatter-graph', 'clickData'),
@@ -4718,7 +4897,10 @@ def register_callbacks(app, default_base_dir):
             html.P(f'Source: {tif_path}', className='tile-meta'),
             plot_with_toolbar(
                 html.Img(src=pil_to_data_uri(crop_img), className='tile-image'),
-                f'{image_name}_crop_y{min_y}-{max_y}_x{min_x}-{max_x}',
+                export_filename(
+                    context['group'], context['task'], image_stem(image_name),
+                    f'crop_y{min_y}-{max_y}_x{min_x}-{max_x}',
+                ),
             ),
         ])
 
@@ -4937,6 +5119,7 @@ def register_callbacks(app, default_base_dir):
     @app.callback(
         Output('overlay-status', 'children'),
         Output('overlay-image', 'src'),
+        Output('overlay-image', 'data-filename'),
         Output('overlay-colorbar', 'src'),
         Output('tile-heatmap-store', 'data', allow_duplicate=True),
         Output('tile-heatmap-status', 'children', allow_duplicate=True),
@@ -4947,9 +5130,12 @@ def register_callbacks(app, default_base_dir):
     )
     def update_overlay(n_clicks, image_name, context):
         if not (n_clicks and context and image_name):
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            return (dash.no_update,) * 6
 
         cleared_heatmaps = {'items': [], 'index': 0}
+        overlay_filename = export_filename(
+            context['group'], context['task'], context['model'], image_stem(image_name), 'prediction_overlay',
+        )
 
         try:
             img_src, tif_path, tile_size, pred_vmin, pred_vmax = build_whole_image_overlay(
@@ -4957,7 +5143,7 @@ def register_callbacks(app, default_base_dir):
             )
         except Exception:
             return (
-                html.Pre(traceback.format_exc(), className='metrics-box'), None, None,
+                html.Pre(traceback.format_exc(), className='metrics-box'), None, overlay_filename, None,
                 cleared_heatmaps, TILE_HEATMAP_IDLE_STATUS,
             )
 
@@ -4966,7 +5152,7 @@ def register_callbacks(app, default_base_dir):
         )
         colorbar_img = build_overlay_colorbar(pred_vmin, pred_vmax)
         return (
-            status, img_src, pil_to_data_uri(colorbar_img),
+            status, img_src, overlay_filename, pil_to_data_uri(colorbar_img),
             cleared_heatmaps, TILE_HEATMAP_IDLE_STATUS,
         )
 
@@ -5015,6 +5201,10 @@ def register_callbacks(app, default_base_dir):
                 items.append({
                     'label': f"{h['filename']}  (x={h['x']}, y={h['y']})",
                     'src': pil_to_data_uri(heatmap_image),
+                    'filename': export_filename(
+                        context['group'], context['task'], context['model'],
+                        image_stem(h['filename']), 'heatmap',
+                    ),
                 })
             except Exception:
                 continue
@@ -5054,24 +5244,26 @@ def register_callbacks(app, default_base_dir):
     @app.callback(
         Output('tile-heatmap-carousel', 'style'),
         Output('tile-heatmap-img', 'src'),
+        Output('tile-heatmap-img', 'data-filename'),
         Output('tile-heatmap-label', 'children'),
         Input('tile-heatmap-store', 'data'),
     )
     def render_tile_heatmap_carousel(data):
         items = (data or {}).get('items') or []
         if not items:
-            return {'display': 'none'}, None, ''
+            return {'display': 'none'}, None, None, ''
 
         index = (data or {}).get('index', 0) % len(items)
         item = items[index]
         label = f"{item['label']}  ({index + 1} / {len(items)})"
-        return {'display': 'block'}, item['src'], label
+        return {'display': 'block'}, item['src'], item.get('filename'), label
 
     @app.callback(
         Output('viewer-status', 'children'),
         Output('viewer-image', 'src'),
         Output('viewer-image', 'data-image-path'),
         Output('viewer-image', 'data-um-per-px'),
+        Output('viewer-image', 'data-filename'),
         Output('viewer-channel-colorbars', 'src'),
         Input('viewer-show-button', 'n_clicks'),
         State('viewer-image-dropdown', 'value'),
@@ -5081,12 +5273,12 @@ def register_callbacks(app, default_base_dir):
     )
     def update_viewer_image(n_clicks, rel_image_path, channel_indices, norm_mode, context):
         if not (n_clicks and context and rel_image_path):
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            return (dash.no_update,) * 6
 
         if not channel_indices:
             return (
                 html.Span('Pick at least one channel.', className='status-error'),
-                dash.no_update, dash.no_update, dash.no_update, None,
+                dash.no_update, dash.no_update, dash.no_update, dash.no_update, None,
             )
 
         scale = VIEWER_SCALE
@@ -5099,7 +5291,7 @@ def register_callbacks(app, default_base_dir):
         except Exception:
             return (
                 html.Pre(traceback.format_exc(), className='metrics-box'),
-                None, dash.no_update, dash.no_update, None,
+                None, dash.no_update, dash.no_update, dash.no_update, None,
             )
 
         channel_names = load_channel_names(context['base_dir'], context['group'], context['task'])
@@ -5113,6 +5305,11 @@ def register_callbacks(app, default_base_dir):
         colorbars_img = build_channel_colorbars(channel_indices, channel_names, channel_max_values)
         return (
             status, pil_to_data_uri(pil_img, compress_level=1), rel_image_path, str(PIXEL_SIZE_UM / scale),
+            export_filename(
+                context['group'], context['task'], image_stem(rel_image_path),
+                '-'.join(channel_names.get(idx, str(idx)) for idx in channel_indices),
+                'per-image-norm' if (norm_mode or NORM_MODE_PER_IMAGE) == NORM_MODE_PER_IMAGE else 'calibration-norm',
+            ),
             pil_to_data_uri(colorbars_img),
         )
 
@@ -5170,6 +5367,15 @@ def register_callbacks(app, default_base_dir):
         except Exception:
             return html.Pre(traceback.format_exc(), className='metrics-box'), []
 
+        region_images = sorted({image_stem(r['image']) for r in region_results})
+
+        def combined_filename(plot_name):
+            return export_filename(
+                context['group'], context['task'],
+                region_images[0] if len(region_images) == 1 else 'multi-image',
+                f'{len(region_results)}regions', compartment, plot_name,
+            )
+
         cards = []
         for i, r in enumerate(region_results):
             color = REGION_COLORS[r['entry_index'] % len(REGION_COLORS)]
@@ -5199,7 +5405,10 @@ def register_callbacks(app, default_base_dir):
                 html.Div(className='region-thumb-wrap', children=[
                     plot_with_toolbar(
                         html.Img(src=pil_to_data_uri(r['thumb']), className='region-thumb-img'),
-                        f'region_{r["entry_index"] + 1}_{r["compartment"]}_thumbnail',
+                        export_filename(
+                            context['group'], context['task'], image_stem(r['image']),
+                            f'region{r["entry_index"] + 1}', r['compartment'], 'thumbnail',
+                        ),
                     ),
                 ]),
             ]))
@@ -5218,7 +5427,7 @@ def register_callbacks(app, default_base_dir):
                         src=pil_to_data_uri(kde_dist), className='umap-card-img',
                         style={'width': '62.5%'},
                     ),
-                    'all_regions_kde_distribution',
+                    combined_filename('kde_distribution'),
                 ),
             ]))
 
@@ -5236,7 +5445,7 @@ def register_callbacks(app, default_base_dir):
                         src=pil_to_data_uri(scatter_dist), className='umap-card-img',
                         style={'width': '62.5%'},
                     ),
-                    'all_regions_scatter_distribution',
+                    combined_filename('scatter_distribution'),
                 ),
             ]))
 
@@ -5252,7 +5461,7 @@ def register_callbacks(app, default_base_dir):
                         src=pil_to_data_uri(boxplot_img), className='umap-card-img',
                         style={'width': '62.5%'},
                     ),
-                    'all_regions_boxplot',
+                    combined_filename('boxplot'),
                 ),
             ]))
 
@@ -5306,7 +5515,9 @@ def register_callbacks(app, default_base_dir):
         Output('umap-store', 'data'),
         Output('metrics-output', 'children'),
         Output('umap-scatter', 'figure'),
+        Output('umap-scatter', 'config'),
         Output('attn-boxplots-img', 'src'),
+        Output('attn-boxplots-img', 'data-filename'),
         Input('explorer-show-button', 'n_clicks'),
         State('explorer-model-dropdown', 'value'),
         State('explorer-context-store', 'data'),
@@ -5315,14 +5526,19 @@ def register_callbacks(app, default_base_dir):
     )
     def update_umap(n_clicks, model_name, context, attn_group_mode):
         if not (n_clicks and context and model_name):
-            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            return (dash.no_update,) * 6
 
         base_dir, group, task = context['base_dir'], context['group'], context['task']
+        umap_config = plotly_export_config(export_filename(group, task, model_name, 'umap_interactive'))
+        attn_filename = attention_boxplots_filename(group, task, model_name, attn_group_mode)
 
         try:
             umap_df = load_umap_df(base_dir, group, task, model_name)
         except Exception:
-            return None, f'Error loading UMAP data:\n\n{traceback.format_exc()}', go.Figure(), None
+            return (
+                None, f'Error loading UMAP data:\n\n{traceback.format_exc()}', go.Figure(), umap_config,
+                None, attn_filename,
+            )
 
         fig = build_umap_figure(umap_df, group, task, model_name)
 
@@ -5347,25 +5563,32 @@ def register_callbacks(app, default_base_dir):
             'max_p': max_p,
             'max_l': max_l,
             'target_col': umap_df.attrs.get('target_col'),
+            'group': group,
+            'task': task,
+            'model_name': model_name,
         }
-        return store_data, metrics_text, fig, attn_boxplots_src
+        return store_data, metrics_text, fig, umap_config, attn_boxplots_src, attn_filename
 
     @app.callback(
         Output('attn-boxplots-img', 'src', allow_duplicate=True),
+        Output('attn-boxplots-img', 'data-filename', allow_duplicate=True),
         Input('attn-group-mode', 'value'),
         State('umap-store', 'data'),
         prevent_initial_call=True,
     )
     def update_attention_boxplots_mode(attn_group_mode, store_data):
         if not store_data or not store_data.get('records'):
-            return dash.no_update
+            return dash.no_update, dash.no_update
 
         umap_df = pd.DataFrame(store_data['records'])
         umap_df.attrs['target_col'] = store_data.get('target_col')
         try:
-            return build_attention_boxplots(umap_df, group_by=attn_group_mode or 'target')
+            src = build_attention_boxplots(umap_df, group_by=attn_group_mode or 'target')
         except Exception:
-            return dash.no_update
+            return dash.no_update, dash.no_update
+        return src, attention_boxplots_filename(
+            store_data.get('group'), store_data.get('task'), store_data.get('model_name'), attn_group_mode,
+        )
 
     @app.callback(
         Output('image-panel-output', 'children'),
@@ -5405,7 +5628,11 @@ def register_callbacks(app, default_base_dir):
             html.P(meta_children, className='tile-meta'),
             plot_with_toolbar(
                 html.Img(src=pil_to_data_uri(heatmap_image), className='tile-image'),
-                os.path.splitext(image_name)[0] + '_heatmap',
+                export_filename(
+                    context['group'], context['task'], store_data.get('model_name'),
+                    image_stem(image_name), 'heatmap',
+                ),
+                export_dpi=HEATMAP_EXPORT_DPI,
             ),
         ])
 
