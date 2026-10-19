@@ -7,6 +7,79 @@ function noriDownloadImage(dataUri, filename) {
   document.body.removeChild(a);
 }
 
+// Resolution written into downloaded canvas PNGs; mirrors EXPORT_DPI in app.py (images
+// rendered on the server already carry it).
+var NORI_EXPORT_DPI = 300;
+
+var NORI_CRC_TABLE = null;
+
+function noriCrc32(bytes) {
+  if (!NORI_CRC_TABLE) {
+    NORI_CRC_TABLE = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) {
+        c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      NORI_CRC_TABLE[n] = c >>> 0;
+    }
+  }
+  var crc = 0xFFFFFFFF;
+  for (var i = 0; i < bytes.length; i++) {
+    crc = NORI_CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+// canvas.toDataURL() PNGs carry no resolution, so image editors open them at 72/96 dpi.
+// Insert a pHYs chunk (pixels per metre) right after the IHDR chunk to mark it as `dpi`.
+function noriPngDataUriWithDpi(dataUri, dpi) {
+  var prefix = 'data:image/png;base64,';
+  if (dataUri.indexOf(prefix) !== 0) {
+    return dataUri;
+  }
+  var binary = atob(dataUri.slice(prefix.length));
+  var png = new Uint8Array(binary.length);
+  for (var i = 0; i < binary.length; i++) {
+    png[i] = binary.charCodeAt(i);
+  }
+
+  var ihdrEnd = 8 + 4 + 4 + 13 + 4;  // signature + IHDR length/type/data/crc
+  var pixelsPerMetre = Math.round(dpi / 0.0254);
+  var chunk = new Uint8Array(4 + 4 + 9 + 4);
+  var view = new DataView(chunk.buffer);
+  view.setUint32(0, 9);
+  chunk.set([0x70, 0x48, 0x59, 0x73], 4);  // 'pHYs'
+  view.setUint32(8, pixelsPerMetre);
+  view.setUint32(12, pixelsPerMetre);
+  chunk[16] = 1;  // unit: metre
+  view.setUint32(17, noriCrc32(chunk.subarray(4, 17)));
+
+  var out = new Uint8Array(png.length + chunk.length);
+  out.set(png.subarray(0, ihdrEnd), 0);
+  out.set(chunk, ihdrEnd);
+  out.set(png.subarray(ihdrEnd), ihdrEnd + chunk.length);
+
+  var outBinary = '';
+  for (var j = 0; j < out.length; j += 0x8000) {
+    outBinary += String.fromCharCode.apply(null, out.subarray(j, j + 0x8000));
+  }
+  return prefix + btoa(outBinary);
+}
+
+// Redraw an <img> enlarged by `scale` (smooth resampling) onto a canvas — used to give
+// small fixed-size images (tile heatmaps) the pixel count a higher export dpi needs.
+function noriUpscaledCanvas(img, scale) {
+  var canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+  var ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
 function noriFlashButton(btn, symbol) {
   var original = btn.textContent;
   btn.textContent = symbol;
@@ -48,8 +121,9 @@ function noriCopyCanvas(canvas, btn) {
 }
 
 // For a zoomed/scrolled .zoom-image, render only the crop currently visible in its
-// .zoom-scroll viewport (at the size it's currently displayed at) onto a canvas.
-function noriVisibleCropCanvas(img) {
+// .zoom-scroll viewport onto a canvas — at the size it's currently displayed at, or with
+// fullResolution at the image's own pixel resolution (for downloads).
+function noriVisibleCropCanvas(img, fullResolution) {
   var scroller = img.closest('.zoom-scroll');
   var displayedWidth = img.clientWidth;
   var displayedHeight = img.clientHeight;
@@ -67,9 +141,10 @@ function noriVisibleCropCanvas(img) {
     return null;
   }
 
+  var outputScale = fullResolution ? scaleToNatural : 1;
   var canvas = document.createElement('canvas');
-  canvas.width = Math.round(visibleWidth);
-  canvas.height = Math.round(visibleHeight);
+  canvas.width = Math.max(1, Math.round(visibleWidth * outputScale));
+  canvas.height = Math.max(1, Math.round(visibleHeight * outputScale));
   canvas.getContext('2d').drawImage(
     img,
     visibleLeft * scaleToNatural, visibleTop * scaleToNatural,
@@ -91,17 +166,19 @@ document.addEventListener('click', function (event) {
   }
 
   var isDownload = btn.classList.contains('plot-download-btn');
-  var baseFilename = btn.getAttribute('data-filename') || 'plot';
+  // A callback-updated plot sets its own data-filename on the img to describe what it
+  // currently shows; the button's is the static fallback.
+  var baseFilename = img.getAttribute('data-filename') || btn.getAttribute('data-filename') || 'plot';
 
   if (img.classList.contains('zoom-image')) {
-    var canvas = noriVisibleCropCanvas(img);
+    var canvas = noriVisibleCropCanvas(img, isDownload);
     if (!canvas) {
       noriFlashButton(btn, '✗');
       return;
     }
     var zoomFilename = baseFilename + '_' + noriCurrentZoom(img) + 'pct.png';
     if (isDownload) {
-      noriDownloadImage(canvas.toDataURL('image/png'), zoomFilename);
+      noriDownloadImage(noriPngDataUriWithDpi(canvas.toDataURL('image/png'), NORI_EXPORT_DPI), zoomFilename);
     } else {
       noriCopyCanvas(canvas, btn);
     }
@@ -109,7 +186,11 @@ document.addEventListener('click', function (event) {
   }
 
   var filename = baseFilename + '.png';
-  if (isDownload) {
+  var exportDpi = parseFloat(btn.getAttribute('data-export-dpi')) || NORI_EXPORT_DPI;
+  if (isDownload && exportDpi > NORI_EXPORT_DPI && img.naturalWidth) {
+    var upscaled = noriUpscaledCanvas(img, exportDpi / NORI_EXPORT_DPI);
+    noriDownloadImage(noriPngDataUriWithDpi(upscaled.toDataURL('image/png'), exportDpi), filename);
+  } else if (isDownload) {
     noriDownloadImage(img.src, filename);
   } else {
     noriCopyImage(img.src, btn);

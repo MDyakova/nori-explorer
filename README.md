@@ -26,6 +26,27 @@ defaults to the current working directory.
 Other flags: `--host` (default `127.0.0.1`), `--port` (default `8050`), and
 `--no-browser` (skip auto-opening a browser tab on start).
 
+### Image viewer cache
+
+Whole-slide images can be large (~1 GB), so the Image viewer caches its work:
+
+- The first time an image/channel is shown, its display statistics and a reduced-size
+  preview are saved to a cache folder (default `~/.cache/nori-explorer`, change with
+  `--cache-dir`). Later opens — including after restarting the app — reuse them instead
+  of re-reading the full `.tif`. A cache entry is rebuilt automatically when its `.tif`
+  changes (different size or modification time).
+- The last 2 opened images stay in memory (`--image-cache-size N`, `0` to disable; each
+  takes about as much RAM as the uncompressed `.tif`), so region analysis doesn't
+  re-read the file for every region.
+- `--precompute` builds the cache for every image under `data/` in the background while
+  the app runs; `--precompute-only` builds it and exits (e.g. run it overnight on the
+  data server):
+  ```bash
+  python app/app.py --base-dir /path/to/data/root --precompute-only
+  ```
+
+When `data/` is on a remote/network disk, keep `--cache-dir` on a fast local disk.
+
 ### Running on a remote machine
 
 - **Just for yourself** (recommended — no extra flags needed): run the command above on
