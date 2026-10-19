@@ -10,13 +10,17 @@ Run with:
 """
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
+import shutil
 import threading
+import time
 import traceback
 import warnings
 import webbrowser
+from collections import OrderedDict
 from urllib.parse import parse_qs, urlencode
 
 import dash
@@ -638,9 +642,11 @@ def list_pred_age_trend_features(base_dir, group, task, kind=None, pred_col='pre
 
 # --- image helpers ------------------------------------------------------
 
-def pil_to_data_uri(img):
+def pil_to_data_uri(img, compress_level=6):
+    """PNG data URI for a PIL image. compress_level 1 (still lossless) encodes large
+    images several times faster than the default 6 for a slightly bigger file."""
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
+    img.save(buf, format='PNG', compress_level=compress_level)
     encoded = base64.b64encode(buf.getvalue()).decode('ascii')
     return f'data:image/png;base64,{encoded}'
 
@@ -1975,20 +1981,284 @@ def build_pairwise_stats_table(results_df, max_rows=100):
 
 # --- whole-image prediction overlay -------------------------------------
 
+def tile_clip_threshold(image_layer, tile=256):
+    """Median of the 99th percentiles of every full tile x tile block of one 2D channel
+    (np.percentile of the whole layer if it's smaller than one tile) - image_filter's
+    outlier-clip level. Computes one row of tiles per np.percentile call rather than one
+    call per tile, which is the same result but much faster on large images."""
+    h, w = image_layer.shape
+    n_rows, n_cols = h // tile, w // tile
+    if not (n_rows and n_cols):
+        return float(np.percentile(image_layer, 99))
+    tile_percentiles = []
+    for step_i in range(n_rows):
+        band = image_layer[step_i * tile:(step_i + 1) * tile, :n_cols * tile]
+        tiles = band.reshape(tile, n_cols, tile).transpose(1, 0, 2).reshape(n_cols, tile * tile)
+        tile_percentiles.append(np.percentile(tiles, 99, axis=1))
+    return float(np.median(np.concatenate(tile_percentiles)))
+
+
 def image_filter(image):
     """Clip each channel at the median per-tile 99th percentile to remove outliers."""
-    all_layers = []
-    for layer in range(image.shape[0]):
-        image_layer = image[layer]
-        all_percentile = []
-        for step_i in range(image_layer.shape[0] // 256):
-            for step_j in range(image_layer.shape[1] // 256):
-                crop = image_layer[step_i * 256:(step_i + 1) * 256, step_j * 256:(step_j + 1) * 256]
-                all_percentile.append(np.percentile(crop, 99))
-        percentile_99 = np.median(all_percentile) if all_percentile else np.percentile(image_layer, 99)
-        image_layer = np.where(image_layer > percentile_99, percentile_99, image_layer)
-        all_layers.append(image_layer)
-    return np.array(all_layers)
+    return np.array([np.minimum(image_layer, tile_clip_threshold(image_layer)) for image_layer in image])
+
+
+# --- Image viewer caches --------------------------------------------------
+# Whole-slide .tif files can be ~1 GB and live on a slow/remote disk, so the Image
+# viewer avoids re-reading and re-processing them on every click:
+# - the last IMAGE_MEMORY_CACHE_SIZE decoded images stay in memory (load_tif_image),
+#   so region analysis doesn't re-read the file once per region;
+# - per-channel display statistics (image_channel_stats) and reduced-size channel
+#   previews (channel_preview) are saved under IMAGE_CACHE_DIR the first time an image
+#   is opened, and reused across restarts until the .tif itself changes;
+# - region-analysis results are memoized (cached_region_analysis), so toggling a plot
+#   type or adding a region only computes what's new.
+# All of these are keyed by the .tif's path + size + modification time, so editing or
+# replacing an image invalidates its cache automatically.
+
+IMAGE_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache', 'nori-explorer')
+IMAGE_MEMORY_CACHE_SIZE = 2
+REGION_RESULT_CACHE_SIZE = 64
+VIEWER_SCALE = 0.25
+
+_image_memory_cache = OrderedDict()
+_image_memory_cache_lock = threading.Lock()
+_channel_stats_lock = threading.Lock()
+_region_result_cache = OrderedDict()
+_region_result_cache_lock = threading.Lock()
+
+
+def configure_image_caches(cache_dir=None, image_memory_cache_size=None):
+    global IMAGE_CACHE_DIR, IMAGE_MEMORY_CACHE_SIZE
+    if cache_dir:
+        IMAGE_CACHE_DIR = os.path.abspath(os.path.expanduser(cache_dir))
+    if image_memory_cache_size is not None:
+        IMAGE_MEMORY_CACHE_SIZE = max(0, int(image_memory_cache_size))
+
+
+def tif_file_key(tif_path):
+    stat = os.stat(tif_path)
+    return os.path.abspath(tif_path), stat.st_size, stat.st_mtime_ns
+
+
+def image_cache_dir(tif_path):
+    """IMAGE_CACHE_DIR/<file stem>_<path hash>/<size>_<mtime>/ for this .tif. Older
+    <size>_<mtime> folders for the same path (from before the file changed) are removed
+    when a new one is created."""
+    abs_path, size, mtime_ns = tif_file_key(tif_path)
+    stem = os.path.splitext(os.path.basename(abs_path))[0]
+    path_hash = hashlib.sha1(abs_path.encode('utf-8')).hexdigest()[:12]
+    image_dir = os.path.join(IMAGE_CACHE_DIR, f'{stem}_{path_hash}')
+    version_dir = os.path.join(image_dir, f'{size}_{mtime_ns}')
+    if not os.path.isdir(version_dir):
+        os.makedirs(version_dir, exist_ok=True)
+        for name in os.listdir(image_dir):
+            if name != os.path.basename(version_dir):
+                shutil.rmtree(os.path.join(image_dir, name), ignore_errors=True)
+    return version_dir
+
+
+def _atomic_write(path, write_fn):
+    tmp_path = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+    with open(tmp_path, 'wb') as f:
+        write_fn(f)
+    os.replace(tmp_path, path)
+
+
+def load_tif_image(tif_path):
+    """Decoded (C, H, W) array for a .tif, kept in an in-memory LRU cache of the last
+    IMAGE_MEMORY_CACHE_SIZE images. The returned array is read-only since it's shared
+    between callers - copy it before modifying."""
+    key = tif_file_key(tif_path)
+    with _image_memory_cache_lock:
+        image = _image_memory_cache.get(key)
+        if image is not None:
+            _image_memory_cache.move_to_end(key)
+            return image
+
+    with TiffFile(tif_path) as tif:
+        image = tif.asarray()
+    image.setflags(write=False)
+
+    if IMAGE_MEMORY_CACHE_SIZE > 0:
+        with _image_memory_cache_lock:
+            for stale_key in [k for k in _image_memory_cache if k[0] == key[0]]:
+                del _image_memory_cache[stale_key]
+            _image_memory_cache[key] = image
+            while len(_image_memory_cache) > IMAGE_MEMORY_CACHE_SIZE:
+                _image_memory_cache.popitem(last=False)
+    return image
+
+
+def image_channel_stats(tif_path, idx, image=None):
+    """Display statistics for one intensity channel of a .tif, computed once from the
+    full-resolution channel and then saved in its cache folder (channel_stats.json):
+    - 'clip': image_filter's outlier-clip level (tile_clip_threshold),
+    - 'filtered_max': the channel's max after that clipping (NORM_MODE_PER_IMAGE's
+      display divisor),
+    - 'p995': the raw 99.5th percentile (NORM_MODE_GLOBAL's divisor for channels other
+      than protein/lipid).
+    `image` can be passed to avoid a load_tif_image call when it's already in hand."""
+    stats_path = os.path.join(image_cache_dir(tif_path), 'channel_stats.json')
+
+    def read_stats():
+        try:
+            with open(stats_path, encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    with _channel_stats_lock:
+        entry = read_stats().get(str(idx))
+    if entry is not None:
+        return entry
+
+    if image is None:
+        image = load_tif_image(tif_path)
+    layer = image[idx]
+    clip = tile_clip_threshold(layer)
+    entry = {
+        'clip': clip,
+        'filtered_max': float(min(float(layer.max()), clip)),
+        'p995': float(np.percentile(layer, 99.5)),
+    }
+    try:
+        with _channel_stats_lock:
+            all_stats = read_stats()
+            all_stats[str(idx)] = entry
+            _atomic_write(stats_path, lambda f: f.write(json.dumps(all_stats, indent=1).encode('utf-8')))
+    except OSError:
+        pass
+    return entry
+
+
+def channel_preview(tif_path, idx, is_mask, scale, image=None):
+    """One channel of a .tif, resized to `scale` of its full size, as a float32 (H, W)
+    array ready for display blending: a mask channel (MASK_CHANNEL_NAMES) as 0/1
+    presence, any other channel as its raw intensity clipped at image_filter's outlier
+    level (see image_channel_stats). Clipping happens at full resolution before
+    resizing, like the original full-size pipeline; the (linear) LANCZOS resize of each
+    channel is then equivalent to resizing the blended RGB image. Saved to the image's
+    cache folder as .npy for reuse, except at scale >= 1 (where the full-size float
+    array would be large and there's no resize to save)."""
+    cache_path = None
+    if scale < 1:
+        kind = 'mask' if is_mask else 'intensity'
+        cache_path = os.path.join(image_cache_dir(tif_path), f'preview_{scale:g}_{idx}_{kind}.npy')
+        try:
+            return np.load(cache_path)
+        except (OSError, ValueError):
+            pass
+
+    if image is None:
+        image = load_tif_image(tif_path)
+    layer = image[idx]
+    if is_mask:
+        full = (layer != 0).astype(np.float32)
+    else:
+        clip = image_channel_stats(tif_path, idx, image)['clip']
+        full = np.minimum(layer.astype(np.float32), np.float32(clip))
+
+    h, w = full.shape
+    size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    preview = full if size == (w, h) else np.asarray(Image.fromarray(full, mode='F').resize(size, Image.LANCZOS))
+
+    if cache_path:
+        try:
+            _atomic_write(cache_path, lambda f: np.save(f, preview))
+        except OSError:
+            pass
+    return preview
+
+
+def cached_region_analysis(base_dir, group, task, rel_image_path, region, **kwargs):
+    """build_region_analysis, memoized on everything its result depends on (the .tif's
+    path/size/mtime, the region, the keyword arguments, channels.txt/masks.txt and
+    max_values.csv) for the last REGION_RESULT_CACHE_SIZE calls. A ValueError (e.g. "no
+    nuclei pixels in this region") is cached and re-raised too. Callers must not modify
+    the returned arrays/thumbnail."""
+    tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
+    key = (
+        tif_file_key(tif_path),
+        json.dumps(region, sort_keys=True),
+        json.dumps(kwargs, sort_keys=True, default=str),
+        tuple(sorted(load_channel_names(base_dir, group, task).items())),
+        load_max_values(base_dir, group, task),
+    )
+    with _region_result_cache_lock:
+        if key in _region_result_cache:
+            _region_result_cache.move_to_end(key)
+            cached = _region_result_cache[key]
+            if isinstance(cached, ValueError):
+                raise cached
+            return cached
+
+    try:
+        result = build_region_analysis(base_dir, group, task, rel_image_path, region, **kwargs)
+    except ValueError as exc:
+        result = exc
+    with _region_result_cache_lock:
+        _region_result_cache[key] = result
+        while len(_region_result_cache) > REGION_RESULT_CACHE_SIZE:
+            _region_result_cache.popitem(last=False)
+    if isinstance(result, ValueError):
+        raise result
+    return result
+
+
+def precompute_viewer_cache(base_dir, scale=VIEWER_SCALE, log=print):
+    """Build the Image viewer's on-disk cache (channel stats + previews, see
+    image_channel_stats/channel_preview) for every .tif under <base_dir>/data/, so the
+    first time each image is opened in the viewer is already fast. Channels listed as
+    masks in any task's masks.txt for that group get a mask preview, all others an
+    intensity preview. Images whose cache is already complete are skipped without
+    being read."""
+    data_dir = os.path.join(base_dir, 'data')
+    if not os.path.isdir(data_dir):
+        log(f'[precompute] No data/ folder under {base_dir} - nothing to do.')
+        return
+
+    for group in sorted(os.listdir(data_dir)):
+        if not os.path.isdir(os.path.join(data_dir, group)):
+            continue
+        group_outputs = os.path.join(base_dir, 'outputs', group)
+        tasks = sorted(os.listdir(group_outputs)) if os.path.isdir(group_outputs) else []
+        mask_idxs = set()
+        for task in tasks:
+            if os.path.isdir(os.path.join(group_outputs, task)):
+                names = load_channel_names(base_dir, group, task)
+                mask_idxs |= {idx for idx, name in names.items() if name.lower() in MASK_CHANNEL_NAMES}
+
+        images = list_data_tif_images(base_dir, group)
+        for i, rel_image_path in enumerate(images, 1):
+            tif_path = os.path.join(data_dir, group, rel_image_path)
+            prefix = f'[precompute] {group}/{rel_image_path} ({i}/{len(images)})'
+            try:
+                with TiffFile(tif_path) as tif:
+                    shape = tif.series[0].shape
+                if len(shape) != 3:
+                    log(f'{prefix}: skipped (expected a (channels, height, width) image, got shape {shape})')
+                    continue
+                cache_dir = image_cache_dir(tif_path)
+                n_channels = shape[0]
+                preview_files = [
+                    os.path.join(cache_dir, f'preview_{scale:g}_{idx}_{"mask" if idx in mask_idxs else "intensity"}.npy')
+                    for idx in range(n_channels)
+                ]
+                if all(os.path.isfile(p) for p in preview_files):
+                    log(f'{prefix}: already cached')
+                    continue
+
+                start_time = time.perf_counter()
+                with TiffFile(tif_path) as tif:
+                    image = tif.asarray()
+                for idx in range(n_channels):
+                    channel_preview(tif_path, idx, idx in mask_idxs, scale, image=image)
+                del image
+                log(f'{prefix}: cached in {time.perf_counter() - start_time:.1f}s')
+            except Exception as exc:
+                log(f'{prefix}: failed ({exc})')
+    log('[precompute] Done.')
 
 
 def compute_whole_image_name(umap_df):
@@ -2258,7 +2528,7 @@ NORM_MODE_OPTIONS = [
 ]
 
 
-def channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l):
+def channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l, stats=None):
     """Normalization divisor for one channel's display intensity (composite image and
     its colorbar) — purely a display scale, independent of the calibrated protein/lipid
     values (mg/mL) computed elsewhere.
@@ -2272,49 +2542,68 @@ def channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l):
       full display range regardless of the calibration file.
     Mask channels (see MASK_CHANNEL_NAMES) always normalize to 1.0, regardless of
     norm_mode - compose_channels shows them as a flat 0/1 presence overlay, not a
-    percentile-scaled intensity."""
+    percentile-scaled intensity. `stats` (image_channel_stats for this channel) supplies
+    the cached per-image values instead of recomputing them from `image`."""
     if name in MASK_CHANNEL_NAMES:
         return 1.0
     if norm_mode == NORM_MODE_PER_IMAGE:
-        filtered = image_filter(image[idx:idx + 1].astype(float))[0]
-        value = float(filtered.max())
+        if stats is not None:
+            value = stats['filtered_max']
+        else:
+            value = float(image_filter(image[idx:idx + 1].astype(np.float32))[0].max())
         return value if value > 0 else 1.0
     if name == 'protein':
         return max_p
     if name == 'lipid':
         return max_l
-    value = float(np.percentile(image[idx], 99.5))
+    value = stats['p995'] if stats is not None else float(np.percentile(image[idx], 99.5))
     return value if value > 0 else 1.0
 
 
-def compose_channels(image, channel_indices, channel_names, channel_norm_max):
-    """Additively blend the given channel indices of a (C, H, W) raw image array into
-    one (H, W, 3) float composite in [0, 1]. Each channel is tinted by its own color —
-    protein=red, lipid=green by default, everything else cycles through a fixed
-    palette — so any number of channels (1, 2, 3, ...) can be shown at once. Mask
-    channels (MASK_CHANNEL_NAMES) skip the outlier-clip/percentile scaling used for
-    intensity channels and are instead shown as a flat tint wherever the mask is
-    nonzero, since they're segmentation labels, not intensities."""
-    h, w = image.shape[1], image.shape[2]
-    composite = np.zeros((h, w, 3), dtype=float)
+def channel_display_colors(channel_indices, channel_names):
+    """[(idx, lowercase name, (r, g, b))] in selection order: protein=red, lipid=green by
+    default, every other channel cycling through CHANNEL_COLOR_PALETTE."""
+    colors = []
     palette_i = 0
     for idx in channel_indices:
         name = channel_names.get(idx, str(idx)).lower()
-        if name in MASK_CHANNEL_NAMES:
-            channel_layer = (image[idx] != 0).astype(float)
-        else:
-            channel_layer = image_filter(image[idx:idx + 1].astype(float))[0]
-            channel_layer = channel_layer / channel_norm_max(idx)
-
-        color = channel_color(name, palette_i)
+        colors.append((idx, name, channel_color(name, palette_i)))
         if name not in CHANNEL_DEFAULT_COLORS:
             palette_i += 1
+    return colors
 
+
+def blend_channel_layers(channel_indices, channel_names, normalized_layer, shape):
+    """Additively blend per-channel display layers into one (H, W, 3) float32 composite
+    in [0, 1]. normalized_layer(idx, name) returns channel idx's (H, W) layer already
+    scaled to its 0..1 display range; `shape` (H, W) is only used if there are no
+    channels. Each channel is tinted by its own color (see channel_display_colors)."""
+    composite = None
+    for idx, name, color in channel_display_colors(channel_indices, channel_names):
+        channel_layer = normalized_layer(idx, name)
+        if composite is None:
+            composite = np.zeros(channel_layer.shape + (3,), dtype=np.float32)
         for c in range(3):
             if color[c]:
                 composite[:, :, c] += channel_layer * color[c]
 
+    if composite is None:
+        return np.zeros(tuple(shape) + (3,), dtype=np.float32)
     return np.clip(composite, 0, 1)
+
+
+def compose_channels(image, channel_indices, channel_names, channel_norm_max):
+    """Additively blend the given channel indices of a (C, H, W) raw image array into
+    one (H, W, 3) float composite in [0, 1] (see blend_channel_layers). Mask channels
+    (MASK_CHANNEL_NAMES) skip the outlier-clip/percentile scaling used for intensity
+    channels and are instead shown as a flat tint wherever the mask is nonzero, since
+    they're segmentation labels, not intensities."""
+    def normalized_layer(idx, name):
+        if name in MASK_CHANNEL_NAMES:
+            return (image[idx] != 0).astype(np.float32)
+        return image_filter(image[idx:idx + 1].astype(np.float32))[0] / np.float32(channel_norm_max(idx))
+
+    return blend_channel_layers(channel_indices, channel_names, normalized_layer, image.shape[1:])
 
 
 def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0, channel_indices=None,
@@ -2327,31 +2616,73 @@ def build_plain_nori_image(base_dir, group, task, rel_image_path, scale=1.0, cha
     norm_mode (NORM_MODE_GLOBAL or NORM_MODE_PER_IMAGE) picks how each channel's display
     intensity is normalized — see channel_norm_max_value. Also returns
     {channel_idx: normalization_max} so a caller can build matching colorbars without
-    re-reading the tif or redoing the percentile computation."""
+    re-reading the tif or redoing the percentile computation.
+
+    Two rendering paths, both giving the same image as blending at full size and then
+    resizing (up to rounding):
+    - if no pixel can exceed full brightness in any RGB component (e.g. the default
+      protein=red + lipid=green with per-image normalization), the cached, already-
+      resized channel previews (channel_preview) are blended directly - resizing is
+      linear, so blending then resizing equals resizing then blending when nothing is
+      clipped;
+    - otherwise (several channels adding into one color component, or a calibration
+      max below the image's own values) the brightness clip has to happen at full size,
+      so the composite is built from the full-size image once and the finished image is
+      saved to the image's cache folder for that exact channel/normalization choice."""
     tif_path = os.path.join(base_dir, 'data', group, rel_image_path)
     channel_names = load_channel_names(base_dir, group, task)
     max_p, max_l = load_max_values(base_dir, group, task)
     channel_indices = channel_indices or [find_channel_index(channel_names, 'protein', 0)]
 
-    with TiffFile(tif_path) as tif:
-        image = tif.asarray()
-
     channel_max_values = {}
-
-    def channel_norm_max(idx):
-        name = channel_names.get(idx, '').lower()
-        value = channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l)
+    channel_stats = {}
+    peak_per_component = [0.0, 0.0, 0.0]
+    for idx, name, color in channel_display_colors(channel_indices, channel_names):
+        is_mask = name in MASK_CHANNEL_NAMES
+        stats = None if is_mask else image_channel_stats(tif_path, idx)
+        value = channel_norm_max_value(None, idx, channel_names.get(idx, '').lower(), norm_mode, max_p, max_l, stats=stats)
         channel_max_values[idx] = value
-        return value
+        channel_stats[idx] = stats
+        peak = 1.0 if is_mask else stats['filtered_max'] / value
+        for c in range(3):
+            peak_per_component[c] += color[c] * peak
+    can_saturate = any(peak > 1.0 for peak in peak_per_component)
 
-    composite = compose_channels(image, channel_indices, channel_names, channel_norm_max)
-    transformed_image = (composite * 255).astype(np.uint8)
-    pil_img = Image.fromarray(transformed_image)
+    if not can_saturate:
+        def normalized_layer(idx, name):
+            return channel_preview(tif_path, idx, name in MASK_CHANNEL_NAMES, scale) / np.float32(channel_max_values[idx])
 
-    width = max(1, round(pil_img.width * scale))
-    height = max(1, round(pil_img.height * scale))
-    if (width, height) != pil_img.size:
-        pil_img = pil_img.resize((width, height), resample=Image.LANCZOS)
+        composite = blend_channel_layers(channel_indices, channel_names, normalized_layer, (1, 1))
+        pil_img = Image.fromarray((composite * 255).astype(np.uint8))
+    else:
+        render_key = json.dumps(
+            [scale, [[idx, name, channel_max_values[idx]] for idx, name, _ in channel_display_colors(channel_indices, channel_names)]],
+        )
+        cache_path = os.path.join(
+            image_cache_dir(tif_path), f'composite_{hashlib.sha1(render_key.encode("utf-8")).hexdigest()[:16]}.png',
+        )
+        try:
+            pil_img = Image.open(cache_path)
+            pil_img.load()
+        except (OSError, ValueError):
+            image = load_tif_image(tif_path)
+
+            def normalized_layer(idx, name):
+                if name in MASK_CHANNEL_NAMES:
+                    return (image[idx] != 0).astype(np.float32)
+                clipped = np.minimum(image[idx].astype(np.float32), np.float32(channel_stats[idx]['clip']))
+                return clipped / np.float32(channel_max_values[idx])
+
+            composite = blend_channel_layers(channel_indices, channel_names, normalized_layer, image.shape[1:])
+            pil_img = Image.fromarray((composite * 255).astype(np.uint8))
+            del composite
+            size = (max(1, round(pil_img.width * scale)), max(1, round(pil_img.height * scale)))
+            if size != pil_img.size:
+                pil_img = pil_img.resize(size, resample=Image.LANCZOS)
+            try:
+                _atomic_write(cache_path, lambda f: pil_img.save(f, format='PNG'))
+            except OSError:
+                pass
 
     # No baked-in scalebar here: this image is shown zoomable/scrollable in the
     # browser (see .zoom-image / data-um-per-px), where a dynamic on-screen scalebar
@@ -2550,8 +2881,7 @@ def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thu
     lipid_idx = find_channel_index(channel_names, 'lipid', 1)
     channel_indices = channel_indices or [protein_idx, lipid_idx]
 
-    with TiffFile(tif_path) as tif:
-        image = tif.asarray()
+    image = load_tif_image(tif_path)
 
     h, w = image[0].shape
     region_type = region.get('type', 'rect')
@@ -2578,7 +2908,8 @@ def build_region_analysis(base_dir, group, task, rel_image_path, region, max_thu
 
     def channel_norm_max(idx):
         name = channel_names.get(idx, '').lower()
-        return channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l)
+        stats = None if name in MASK_CHANNEL_NAMES else image_channel_stats(tif_path, idx, image)
+        return channel_norm_max_value(image, idx, name, norm_mode, max_p, max_l, stats=stats)
 
     image_crop = image[:, y0:y1, x0:x1]
     if mask is not None:
@@ -4758,7 +5089,7 @@ def register_callbacks(app, default_base_dir):
                 dash.no_update, dash.no_update, dash.no_update, None,
             )
 
-        scale = 0.25
+        scale = VIEWER_SCALE
 
         try:
             pil_img, tif_path, channel_max_values = build_plain_nori_image(
@@ -4781,7 +5112,7 @@ def register_callbacks(app, default_base_dir):
         )
         colorbars_img = build_channel_colorbars(channel_indices, channel_names, channel_max_values)
         return (
-            status, pil_to_data_uri(pil_img), rel_image_path, str(PIXEL_SIZE_UM / scale),
+            status, pil_to_data_uri(pil_img, compress_level=1), rel_image_path, str(PIXEL_SIZE_UM / scale),
             pil_to_data_uri(colorbars_img),
         )
 
@@ -4818,7 +5149,7 @@ def register_callbacks(app, default_base_dir):
                 region = {'type': entry.get('type', 'rect'), 'points': entry['points']}
                 try:
                     thumb, px_bbox, protein, lipid, mean_protein, mean_lipid, n_outliers, extra_channels = (
-                        build_region_analysis(
+                        cached_region_analysis(
                             context['base_dir'], context['group'], context['task'], rel_image_path,
                             region, channel_indices=channel_indices,
                             norm_mode=norm_mode or NORM_MODE_PER_IMAGE, compartment=compartment,
@@ -5079,8 +5410,15 @@ def register_callbacks(app, default_base_dir):
         ])
 
 
-def start(host='127.0.0.1', port=8050, debug=False, open_browser=True, base_dir=None):
+def start(host='127.0.0.1', port=8050, debug=False, open_browser=True, base_dir=None, precompute=False):
     app = create_app(default_base_dir=base_dir)
+
+    if precompute:
+        # Background thread so the UI is usable right away; images not cached yet are
+        # still cached on first open as usual.
+        threading.Thread(
+            target=precompute_viewer_cache, args=(base_dir or os.getcwd(),), daemon=True,
+        ).start()
 
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(f'http://{host}:{port}')).start()
@@ -5101,5 +5439,34 @@ if __name__ == '__main__':
         '--no-browser', action='store_true',
         help='Do not auto-open a browser on start (useful on a headless/remote machine).',
     )
+    parser.add_argument(
+        '--cache-dir', default=None,
+        help='Where the Image viewer saves per-image caches (channel previews and display '
+             'statistics). Put it on a fast local disk when data/ is on a remote disk '
+             f'(default: {IMAGE_CACHE_DIR}).',
+    )
+    parser.add_argument(
+        '--image-cache-size', type=int, default=IMAGE_MEMORY_CACHE_SIZE,
+        help='How many decoded whole-slide images the Image viewer keeps in memory '
+             f'(default: {IMAGE_MEMORY_CACHE_SIZE}; each takes about as much RAM as the '
+             'uncompressed .tif; 0 disables).',
+    )
+    parser.add_argument(
+        '--precompute', action='store_true',
+        help='While the app runs, build the Image viewer cache for every image under '
+             'data/ in the background.',
+    )
+    parser.add_argument(
+        '--precompute-only', action='store_true',
+        help='Build the Image viewer cache for every image under data/, then exit '
+             'without starting the app (e.g. to run overnight on the data server).',
+    )
     args = parser.parse_args()
-    start(host=args.host, port=args.port, open_browser=not args.no_browser, base_dir=args.base_dir)
+    configure_image_caches(cache_dir=args.cache_dir, image_memory_cache_size=args.image_cache_size)
+    if args.precompute_only:
+        precompute_viewer_cache(args.base_dir or os.getcwd())
+    else:
+        start(
+            host=args.host, port=args.port, open_browser=not args.no_browser, base_dir=args.base_dir,
+            precompute=args.precompute,
+        )
